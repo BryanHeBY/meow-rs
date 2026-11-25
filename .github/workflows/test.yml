@@ -520,7 +520,7 @@ jobs:
 
       - name: AnyTLS unit and integration tests (embedded server)
         run: |
-          cargo nextest run -p meow-anytls --lib --retries 2 --no-fail-fast
+          cargo nextest run -p meow-anytls --features server --lib --retries 2 --no-fail-fast
           cargo nextest run -p meow-proxy --features anytls --lib \
             --test anytls_integration --test anytls_leak --retries 2 --no-fail-fast
 
