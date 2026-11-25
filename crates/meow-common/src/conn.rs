@@ -122,6 +122,13 @@ pub trait ProxyPacketConn: Send + Sync {
         let _ = self;
         None
     }
+
+    /// A borrowed poll view for a caller that owns the sole waiter in a
+    /// direction and keeps this connection alive throughout the wait.
+    /// Same per-direction readiness contract as the owned view.
+    fn poll_packet_conn_ref(&self) -> Option<&dyn PollPacketConn> {
+        None
+    }
 }
 
 /// The synchronous-poll counterpart of [`ProxyPacketConn`], obtained

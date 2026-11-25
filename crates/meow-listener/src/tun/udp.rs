@@ -777,10 +777,20 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let mut reply_task = tokio::task::JoinSet::new();
     reply_task.spawn({
         let conn = std::sync::Arc::clone(&conn);
+        // This dedicated task is the only read waiter. Native datagram
+        // sockets can take the poll path with no boxed read future; framed
+        // UDP keeps the original non-cancelled async read.
+        let fast = std::sync::Arc::clone(&conn).poll_packet_conn();
         async move {
             let mut rbuf = vec![0u8; DATAGRAM_BUF];
             loop {
-                match conn.read_packet(&mut rbuf).await {
+                let received = match &fast {
+                    Some(fast) => {
+                        std::future::poll_fn(|cx| fast.poll_read_packet(cx, &mut rbuf)).await
+                    }
+                    None => conn.read_packet(&mut rbuf).await,
+                };
+                match received {
                     Ok((n, _from)) => {
                         if up_tx.send(rbuf[..n].to_vec()).await.is_err() {
                             return Ok(()); // flow gone
