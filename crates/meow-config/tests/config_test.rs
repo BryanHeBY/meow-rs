@@ -165,6 +165,30 @@ proxy-providers:
     assert!(error.to_string().contains("bad-node"), "{error}");
 }
 
+#[tokio::test]
+async fn proxy_provider_udp_and_affix_overrides_follow_filtering() {
+    let config = load_config_from_str(
+        r#"strict: true
+proxy-providers:
+  local:
+    type: inline
+    filter: '^raw-'
+    override: {udp: false, additional-prefix: 'P-', additional-suffix: '-S'}
+    payload:
+      - {name: raw-one, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+      - {name: other, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: Local, type: select, use: [local], filter: '^P-'}
+rules: ["MATCH,Local"]
+"#,
+    )
+    .await
+    .unwrap();
+    let group = &config.proxies["Local"];
+    assert_eq!(group.members().unwrap(), ["P-raw-one-S"]);
+    assert!(!group.support_udp());
+}
+
 /// Issue #561: a group may not reuse the name of an existing registry
 /// entry. Before the duplicate-name check, this config built: `parent`
 /// captured the leaf `child`, then the group `child` replaced the

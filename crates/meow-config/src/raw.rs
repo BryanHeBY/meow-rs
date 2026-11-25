@@ -1729,8 +1729,9 @@ pub struct RawProxyProvider {
     pub dialer_proxy: Option<String>,
     /// mihomo `override:` block — provider-level defaults applied to every
     /// node unconditionally (`OverrideSchema.Apply` writes last, so it
-    /// outranks node-level fields). Only `dialer-proxy` is honoured
-    /// (issue #489); other keys warn at load time.
+    /// outranks node-level fields). Supported keys: `dialer-proxy`,
+    /// `udp`, `additional-prefix`, and `additional-suffix`.
+    /// Other keys warn at load time.
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<HashMap<String, serde_json::Value>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
