@@ -1,5 +1,41 @@
 use meow_config::{load_config_from_str, ListenerSpec};
 
+#[cfg(feature = "trojan")]
+#[tokio::test]
+async fn quoted_trojan_ports_survive_config_and_file_provider_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        dir.path().join("nodes.yaml"),
+        r#"proxies:
+  - {name: Provider-T, type: trojan, server: 127.0.0.1, port: "443", password: fixture}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &path,
+        r#"strict: true
+proxies:
+  - {name: Static-T, type: trojan, server: 127.0.0.1, port: "443", password: fixture}
+proxy-providers:
+  fixture:
+    type: file
+    path: nodes.yaml
+proxy-groups:
+  - {name: Group, type: select, proxies: [Static-T], use: [fixture]}
+rules: ["MATCH,Group"]
+"#,
+    )
+    .unwrap();
+
+    let config = meow_config::load_config(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(config.proxies.contains_key("Static-T"));
+    let members = config.proxies["Group"].members().unwrap();
+    assert_eq!(members.as_slice(), ["Static-T", "Provider-T"]);
+}
+
 // Some tests use #[tokio::test] because ShadowsocksAdapter plugin startup
 // internally requires a tokio runtime (tokio::process::Command).
 

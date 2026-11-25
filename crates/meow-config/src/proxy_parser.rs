@@ -19,15 +19,32 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Accept the integer and quoted decimal spellings used by Clash subscriptions.
+fn parse_endpoint_port(
+    value: &serde_json::Value,
+    context: &str,
+) -> std::result::Result<u16, String> {
+    let invalid = || format!("{context}: port must be an integer or a decimal string");
+    let raw = match value {
+        serde_json::Value::String(text)
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            text.parse::<u64>()
+                .map_err(|_| format!("{context}: port exceeds 65535"))?
+        }
+        _ => value.as_u64().ok_or_else(invalid)?,
+    };
+    u16::try_from(raw).map_err(|_| format!("{context}: port {raw} exceeds 65535"))
+}
+
 fn required_port(
     config: &HashMap<String, serde_json::Value>,
     context: &str,
 ) -> std::result::Result<u16, String> {
-    let raw = config
+    let value = config
         .get("port")
-        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| format!("{context}: missing port"))?;
-    let port = u16::try_from(raw).map_err(|_| format!("{context}: port {raw} exceeds 65535"))?;
+    let port = parse_endpoint_port(value, context)?;
     if port == 0 {
         return Err(format!("{context}: port must be non-zero"));
     }
@@ -93,7 +110,7 @@ impl WrappedProxy {
         let host = config.get("server").and_then(serde_json::Value::as_str);
         let port = config
             .get("port")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| parse_endpoint_port(value, "proxy").ok())
             .filter(|&port| port > 0)
             .or_else(|| {
                 // A `ports`-only node (hysteria2's hopping range, which may
@@ -103,10 +120,9 @@ impl WrappedProxy {
                     .get("ports")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|ports| ports.split([',', '-']).next())
-                    .and_then(|first| first.trim().parse::<u64>().ok())
+                    .and_then(|first| first.trim().parse::<u16>().ok())
                     .filter(|&port| port > 0)
-            })
-            .and_then(|port| u16::try_from(port).ok());
+            });
         if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
             self.hop = Some(DialerHop {
                 dialer: Arc::clone(dialer),
@@ -2437,11 +2453,7 @@ fn hy2_dial_port(
     let explicit = match config.get("port") {
         None => None,
         Some(value) => {
-            let raw = value
-                .as_u64()
-                .ok_or_else(|| format!("hysteria2[{name}]: missing port"))?;
-            let port = u16::try_from(raw)
-                .map_err(|_| format!("hysteria2[{name}]: port {raw} exceeds 65535"))?;
+            let port = parse_endpoint_port(value, &format!("hysteria2[{name}]"))?;
             if port == 0 && ports.is_none() {
                 return Err(format!("hysteria2[{name}]: port must be non-zero"));
             }
@@ -5923,6 +5935,46 @@ mod tests {
         assert_eq!(ws_max_early_data(Some(&huge)), MAX_WS_EARLY_DATA);
     }
 
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn trojan_accepts_quoted_port_in_static_and_provider_nodes() {
+        for port in ["443", "'443'", r#""443""#, "'65535'"] {
+            let cfg = proxy_config(&format!(
+                "name: sample\ntype: trojan\nserver: 127.0.0.1\npassword: fixture\nport: {port}\n"
+            ));
+            let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+                Arc::new(meow_proxy::dialer::DirectDialer);
+            assert!(parse_proxy(&cfg).is_ok(), "static port {port}");
+            assert!(
+                super::parse_proxy_provider_node(&cfg, true, false, &dialer).is_ok(),
+                "provider port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_port_rejects_invalid_strings_and_types() {
+        for (port, message) in [
+            ("'0'", "non-zero"),
+            ("'65536'", "exceeds 65535"),
+            ("'18446744073709551616'", "exceeds 65535"),
+            ("'-1'", "decimal string"),
+            ("'443.5'", "decimal string"),
+            ("'443-444'", "decimal string"),
+            ("true", "decimal string"),
+            ("443.5", "decimal string"),
+            ("null", "decimal string"),
+        ] {
+            let cfg = proxy_config(&format!(
+                "name: bad\ntype: http\nserver: 127.0.0.1\nport: {port}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("invalid port {port} was accepted");
+            };
+            assert!(err.contains(message), "{port}: {err}");
+        }
+    }
+
     #[test]
     fn parse_proxy_rejects_port_overflow() {
         let cfg = proxy_config("name: bad\ntype: http\nserver: 1.2.3.4\nport: 65536\n");
@@ -6848,7 +6900,7 @@ tls: true
             Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
         for yaml in [
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443-8446'\npassword: secret\n",
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: '0'\nports: '443,8443'\npassword: secret\n",
         ] {
             let cfg = hy2_config(yaml);
             let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
@@ -6880,7 +6932,7 @@ tls: true
         let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
         let cfg = hy2_config(
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 9443\nports: '443,8443'\npassword: secret\n",
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: '9443'\nports: '443,8443'\npassword: secret\n",
         );
         let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
             .unwrap_or_else(|e| panic!("explicit-port chain must parse: {e}"));
