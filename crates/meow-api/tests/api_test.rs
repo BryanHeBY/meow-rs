@@ -10745,7 +10745,7 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
 /// exits `fetch_source` early via `deferred_initial`, so it would not
 /// catch a regression that loads *every* vehicle on the lane — a
 /// direct-dialed blackhole would stall there. Only `file:` providers may
-/// ever load synchronously during materialize (`is_file_vehicle`).
+/// ever load synchronously during materialize; inline payloads are local too.
 #[tokio::test]
 async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
     let _globals_lane = process_globals_lane().await;

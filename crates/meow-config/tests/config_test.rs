@@ -126,6 +126,45 @@ proxy-groups:
     assert_eq!(fallback.current().as_deref(), Some("node-a"));
 }
 
+#[tokio::test]
+async fn inline_proxy_provider_builds_without_a_cache_directory() {
+    let config = load_config_from_str(
+        r#"strict: true
+proxy-providers:
+  local:
+    type: inline
+    filter: '^keep'
+    payload:
+      - {name: keep-node, type: socks5, server: 127.0.0.1, port: '1080'}
+      - {name: filtered, type: socks5, server: 127.0.0.1, port: 1080}
+proxy-groups:
+  - {name: Local, type: select, use: [local]}
+rules: ["MATCH,Local"]
+"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(config.proxies["Local"].members().unwrap(), ["keep-node"]);
+}
+
+#[tokio::test]
+async fn strict_rejects_malformed_inline_provider_node() {
+    let result = load_config_from_str(
+        r#"strict: true
+proxy-providers:
+  local:
+    type: inline
+    payload:
+      - {name: bad-node, type: socks5, server: 127.0.0.1, port: invalid}
+"#,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("malformed local payload must not pass strict validation");
+    };
+    assert!(error.to_string().contains("bad-node"), "{error}");
+}
+
 /// Issue #561: a group may not reuse the name of an existing registry
 /// entry. Before the duplicate-name check, this config built: `parent`
 /// captured the leaf `child`, then the group `child` replaced the

@@ -1693,6 +1693,9 @@ pub struct RawProxyGroup {
 pub struct RawProxyProvider {
     #[serde(rename = "type")]
     pub provider_type: String,
+    /// Proxy definitions embedded in the main config (only for `type: inline`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<HashMap<String, serde_json::Value>>>,
     pub url: Option<String>,
     pub path: Option<String>,
     pub interval: Option<u64>,
