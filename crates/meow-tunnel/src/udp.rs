@@ -2,10 +2,13 @@ use crate::statistics::{ConnCounters, Statistics};
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicU, Int};
-use meow_common::{with_dial_timeout, AdapterType, Metadata, ProxyAdapter, ProxyPacketConn};
+use meow_common::{
+    with_dial_timeout, AdapterType, Metadata, PollPacketConn, ProxyAdapter, ProxyPacketConn,
+};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -36,6 +39,18 @@ impl UdpSession {
             conn,
             proxy_name,
             last_activity_ms: AtomicU::new(monotonic_ms() as meow_common::atomic::Uint),
+        }
+    }
+
+    /// Read a reply using native readiness when available. The caller owns
+    /// the sole reader for this session; it must not concurrently use this
+    /// method or `conn.read_packet` on the same association. Stream-framed
+    /// adapters still use their async read, which must not be cancelled
+    /// unless the caller is tearing down the whole association.
+    pub async fn read_reply(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        match self.conn.poll_packet_conn_ref() {
+            Some(fast) => std::future::poll_fn(|cx| fast.poll_read_packet(cx, buf)).await,
+            None => self.conn.read_packet(buf).await,
         }
     }
 
@@ -87,7 +102,8 @@ pub fn new_nat_table() -> NatTable {
 /// `UdpSession::conn`). Costs each datagram one more boxed future
 /// (`async_trait`) than the bare conn.
 struct CountedPacketConn {
-    conn: Box<dyn ProxyPacketConn>,
+    conn: Arc<dyn ProxyPacketConn>,
+    fast: Option<Arc<dyn PollPacketConn>>,
     stats: Arc<Statistics>,
     counters: Arc<ConnCounters>,
 }
@@ -112,6 +128,49 @@ impl ProxyPacketConn for CountedPacketConn {
 
     fn close(&self) -> meow_common::Result<()> {
         self.conn.close()
+    }
+
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        self.fast.as_ref()?;
+        Some(self)
+    }
+
+    fn poll_packet_conn_ref(&self) -> Option<&dyn PollPacketConn> {
+        self.fast.as_ref()?;
+        Some(self)
+    }
+}
+
+// Return the counted view, not the raw socket: readiness must never bypass
+// the flow, per-proxy or ledger counters. Async callers retain their existing
+// readiness semantics; only owners with one waiter per direction use this.
+impl PollPacketConn for CountedPacketConn {
+    fn poll_read_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<meow_common::Result<(usize, SocketAddr)>> {
+        let fast = self
+            .fast
+            .as_ref()
+            .expect("poll capability requires a native poll view");
+        fast.poll_read_packet(cx, buf).map(|result| {
+            result.inspect(|(n, _)| self.stats.record_download(&self.counters, *n as Int))
+        })
+    }
+
+    fn poll_write_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> Poll<meow_common::Result<usize>> {
+        let fast = self
+            .fast
+            .as_ref()
+            .expect("poll capability requires a native poll view");
+        fast.poll_write_packet(cx, buf, addr)
+            .map(|result| result.inspect(|n| self.stats.record_upload(&self.counters, *n as Int)))
     }
 }
 
@@ -177,8 +236,11 @@ impl TunnelInner {
             return Ok(conn);
         };
         let leaf = leaf.as_deref().map_or(proxy.name(), |leaf| leaf.name());
+        let conn: Arc<dyn ProxyPacketConn> = Arc::from(conn);
+        let fast = Arc::clone(&conn).poll_packet_conn();
         Ok(Box::new(CountedPacketConn {
             conn,
+            fast,
             stats: Arc::clone(&self.stats),
             counters: self.stats.begin_udp_flow(leaf, || via, metadata),
         }))
@@ -616,11 +678,10 @@ mod tests {
         handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
         let session = Arc::clone(tunnel.inner().nat_table.get(&(src, dst)).unwrap().value());
         let mut buf = [0u8; 64];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_secs(5), session.conn.read_packet(&mut buf))
-                .await
-                .expect("a reply")
-                .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), session.read_reply(&mut buf))
+            .await
+            .expect("a reply")
+            .unwrap();
         assert_eq!(&buf[..n], b"pong!!");
         assert_eq!(stats.snapshot(), (4, 6));
         let by_proxy = stats.proxy_traffic();
@@ -634,6 +695,46 @@ mod tests {
         assert!(tunnel.inner().nat_table.contains_key(&(src, dst)));
         assert_eq!(stats.snapshot(), (4, 6));
         assert_eq!(stats.proxy_traffic(), by_proxy);
+    }
+
+    #[tokio::test]
+    async fn counted_direct_udp_poll_view_counts_both_directions_once() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = echo.local_addr().unwrap();
+        let src = "127.0.0.1:40000".parse().unwrap();
+        let tunnel = mk_tunnel();
+        let proxy = meow_proxy::DirectAdapter::new();
+        let md = mk_metadata(src, dst);
+        let conn: Arc<dyn ProxyPacketConn> =
+            Arc::from(tunnel.inner().dial_udp(&proxy, &md).await.unwrap());
+        let fast = Arc::clone(&conn)
+            .poll_packet_conn()
+            .expect("DIRECT retains its poll view");
+        assert_eq!(
+            std::future::poll_fn(|cx| fast.poll_write_packet(cx, b"ping", &dst))
+                .await
+                .unwrap(),
+            4
+        );
+        let mut buf = [0; 32];
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        echo.send_to(b"reply", peer).await.unwrap();
+        let (n, from) = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| fast.poll_read_packet(cx, &mut buf)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(from, dst);
+        assert_eq!(&buf[..n], b"reply");
+        let stats = tunnel.statistics();
+        assert_eq!(stats.snapshot(), (4, 5));
+        assert_eq!(stats.proxy_traffic().get("DIRECT"), Some(&(4, 5)));
     }
 
     /// An instant-dial UDP leaf for traffic-attribution tests.
