@@ -268,6 +268,7 @@ fn split_exclude_types(raw: Option<&[String]>) -> Vec<String> {
 
 enum Vehicle {
     File(PathBuf),
+    Inline(String),
     Http {
         url: String,
         /// `None` = fetch to memory only (no containment root available for
@@ -322,6 +323,9 @@ impl ProxyProvider {
         // cache location — are attacker-influenced when the config document
         // does not come from a trusted on-disk file. Without a `cache_dir`
         // there is no containment root, so no caller-named path is honoured.
+        if raw.provider_type != "inline" && raw.payload.is_some() {
+            warn!(provider = %name, "proxy-provider fallback payload is not supported for non-inline providers");
+        }
         let (vehicle, vehicle_type) = match raw.provider_type.as_str() {
             "file" => {
                 let path_str = raw
@@ -377,6 +381,14 @@ impl ProxyProvider {
                 };
                 (Vehicle::Http { url, cache_path }, "HTTP")
             }
+            "inline" => {
+                // JSON is accepted by the shared YAML ingest and preserves
+                // scalar types. No temp file, fetch, or cache is involved.
+                let payload = raw.payload.as_deref().unwrap_or_default();
+                let text = serde_json::to_string(payload)
+                    .map_err(|e| format!("proxy-provider '{name}': invalid inline payload: {e}"))?;
+                (Vehicle::Inline(text), "Inline")
+            }
             t => return Err(format!("unknown proxy-provider type '{t}'")),
         };
 
@@ -418,10 +430,10 @@ impl ProxyProvider {
                 ));
             }
         };
-        if download_proxy.is_some() && raw.provider_type == "file" {
+        if download_proxy.is_some() && raw.provider_type != "http" {
             warn!(
                 provider = %name,
-                "proxy-provider 'proxy' has no effect on a 'file' provider — \
+                "proxy-provider 'proxy' has no effect on a local provider — \
                  there is no fetch to chain"
             );
         }
@@ -632,6 +644,7 @@ impl ProxyProvider {
     async fn fetch_source(&self) -> Result<(String, Option<SubscriptionUserinfo>), String> {
         let registry = &self.dialer_registry;
         match &self.vehicle {
+            Vehicle::Inline(text) => Ok((text.clone(), None)),
             Vehicle::File(path) => tokio::fs::read_to_string(path)
                 .await
                 .map(|text| (text, None))
@@ -707,7 +720,7 @@ impl ProxyProvider {
                     .await
                     .map(|text| (text, Source::Cache))
             }
-            Vehicle::File(_) => Err(e),
+            Vehicle::File(_) | Vehicle::Inline(_) => Err(e),
         }
     }
 
@@ -943,11 +956,10 @@ impl ProxyProvider {
         true
     }
 
-    /// `true` when this provider reads its payload from a local `file:` —
-    /// the only vehicle whose payload is operator-authored, and the only
-    /// one the synchronous materialize path can validate before commit.
-    pub(crate) fn is_file_vehicle(&self) -> bool {
-        matches!(self.vehicle, Vehicle::File(_))
+    /// Local payloads are operator-authored and can be validated during
+    /// synchronous materialize without downloading third-party bytes.
+    pub(crate) fn is_local_vehicle(&self) -> bool {
+        matches!(self.vehicle, Vehicle::File(_) | Vehicle::Inline(_))
     }
 
     /// The startup fetch for a provider without a usable cache. `Err` only
@@ -1015,7 +1027,7 @@ impl ProxyProvider {
                 // fail-closed on them. Remote bytes degrade to the
                 // acquisition shape — the feed's owner cannot veto this
                 // daemon's config by serving malformed content.
-                if strict && self.is_file_vehicle() {
+                if strict && self.is_local_vehicle() {
                     return Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name));
                 }
                 warn_initial_load_failure(self, &e.to_string());
@@ -1032,7 +1044,7 @@ impl ProxyProvider {
     /// [`crate::rule_provider::fetch_http_blocking`] — so it works whether
     /// or not the caller already sits inside a Tokio runtime.
     ///
-    /// Only ever called on [`Vehicle::File`] providers: remote payloads
+    /// Only ever called on local providers: remote payloads
     /// keep their detached-fetch contract and never block the caller —
     /// asserted below so a future caller on an `http:` vehicle cannot
     /// reintroduce a lane-blocking `fetch_response` by mistake. The
@@ -1052,8 +1064,8 @@ impl ProxyProvider {
     /// direction for a parse bug.
     pub(crate) fn initial_load_blocking(&self, strict: bool) -> anyhow::Result<bool> {
         debug_assert!(
-            self.is_file_vehicle(),
-            "initial_load_blocking is the file-vehicle gate; on a remote vehicle it \
+            self.is_local_vehicle(),
+            "initial_load_blocking is the local-vehicle gate; on a remote vehicle it \
              would run a real network fetch on the caller's lane"
         );
         let name = self.name.clone();
@@ -1786,7 +1798,7 @@ pub async fn load_proxy_providers_within(
                 continue;
             }
         };
-        if matches!(provider.vehicle, Vehicle::File(_)) {
+        if provider.is_local_vehicle() {
             // A `file:` payload is local, operator-authored content — it
             // must read identically under `-t` and at boot, so it loads
             // before the offline short-circuit below (mirroring the
@@ -1975,7 +1987,7 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
         warn!(provider = %provider.name, error = %error,
             "initial provider load failed (proxy not resolvable yet); \
              starting empty — will retry once the route map is published");
-    } else if provider.is_file_vehicle() {
+    } else if provider.is_local_vehicle() {
         // A `file:` read failure owes no startup background fetch —
         // `background_pending` is only set for remote vehicles — so it
         // heals on an `interval:` tick, a manual refresh, or the detached
@@ -2120,6 +2132,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
             extra: Default::default(),
@@ -2188,6 +2201,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
             extra: Default::default(),
@@ -2240,6 +2254,7 @@ mod tests {
                 allow_external_plugin: None,
                 header: None,
                 override_: None,
+                payload: None,
                 proxy: None,
                 dialer_proxy: None,
                 extra: Default::default(),
@@ -2269,6 +2284,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
             extra: Default::default(),
@@ -2307,6 +2323,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
             extra: Default::default(),
@@ -4021,6 +4038,7 @@ header:
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: proxy.map(str::to_string),
             dialer_proxy: None,
             extra: Default::default(),

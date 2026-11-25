@@ -3279,7 +3279,7 @@ fn materialize_proxy_providers(
             Some(Arc::clone(provider_dns_cell)),
         ) {
             Ok(provider) => {
-                // A new `file:` provider's payload is local content —
+                // A new file or inline provider's payload is local content —
                 // validate it now so a strict candidate cannot commit a
                 // payload the next boot would refuse (PUT /configs → 400
                 // leaving live state untouched). The load stays
@@ -3290,7 +3290,7 @@ fn materialize_proxy_providers(
                 // the commit's detached acquisition retries the read.
                 // Reused providers above are never reloaded; remote
                 // providers never load on this path.
-                if provider.is_file_vehicle() {
+                if provider.is_local_vehicle() {
                     provider.initial_load_blocking(strict)?;
                 } else if let Some(content) = inherited {
                     // Remote bytes degrade rather than reject — the same
