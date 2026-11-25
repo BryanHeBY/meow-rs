@@ -150,6 +150,7 @@ pub struct ProxyProvider {
     /// every node unconditionally; the strongest of the three levels
     /// (override > provider > node) (issue #489).
     override_dialer: Option<String>,
+    node_override: NodeOverride,
     /// Serializes `refresh` so `slot`, `declared_dialers`, and `derived`
     /// can never be populated from different payload generations — the
     /// provider-refresh API endpoint is not serialized by the config
@@ -264,6 +265,64 @@ fn split_exclude_types(raw: Option<&[String]>) -> Vec<String> {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The provider-wide fields applied after provider filtering but before
+/// adapter construction, the same ordering as Mihomo.
+#[derive(Default)]
+struct NodeOverride {
+    udp: Option<bool>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+impl NodeOverride {
+    fn from_raw(
+        name: &str,
+        raw: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Self, String> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let get = |key| raw.get(key).filter(|value| !value.is_null());
+        let string = |key| {
+            get(key)
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!("proxy-provider '{name}': override.{key} must be a string")
+                    })
+                })
+                .transpose()
+        };
+        let udp = get("udp")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    format!("proxy-provider '{name}': override.udp must be a boolean")
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            udp,
+            prefix: string("additional-prefix")?,
+            suffix: string("additional-suffix")?,
+        })
+    }
+
+    fn apply(&self, node: &mut HashMap<String, serde_json::Value>) {
+        if let Some(udp) = self.udp {
+            node.insert("udp".into(), udp.into());
+        }
+        if self.prefix.is_none() && self.suffix.is_none() {
+            return;
+        }
+        if let Some(serde_json::Value::String(name)) = node.get_mut("name") {
+            *name = format!(
+                "{}{name}{}",
+                self.prefix.as_deref().unwrap_or_default(),
+                self.suffix.as_deref().unwrap_or_default()
+            );
+        }
+    }
 }
 
 enum Vehicle {
@@ -454,15 +513,16 @@ impl ProxyProvider {
             }
         };
 
-        // mihomo `override:` — provider-level node defaults. Only
-        // `dialer-proxy` is honoured; every other key warns so a config
-        // relying on, say, `override.udp` does not silently diverge.
-        // `override.Apply` writes unconditionally — it outranks both the
-        // provider-level field and node-level `dialer-proxy`.
+        // Mihomo's override writes unconditionally, outranking node fields
+        // and, for dialer-proxy, the provider-level setting.
+        let node_override = NodeOverride::from_raw(name, raw.override_.as_ref())?;
         let mut override_dialer = None;
         if let Some(over) = raw.override_.as_ref() {
             for key in over.keys() {
-                if key != "dialer-proxy" {
+                if !matches!(
+                    key.as_str(),
+                    "dialer-proxy" | "udp" | "additional-prefix" | "additional-suffix"
+                ) {
                     warn!(provider = %name, "proxy-provider override key '{key}' is not supported");
                 }
             }
@@ -521,6 +581,7 @@ impl ProxyProvider {
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
+            node_override,
             refresh_lock: tokio::sync::Mutex::new(()),
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
@@ -1270,7 +1331,7 @@ impl ProxyProvider {
 
         let mut declared = Vec::new();
         let mut result = Vec::new();
-        for raw_map in &proxy_maps {
+        for mut raw_map in proxy_maps {
             // Get raw name/type before parsing so we can filter cheaply.
             let raw_name = raw_map.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let raw_type = raw_map
@@ -1293,7 +1354,9 @@ impl ProxyProvider {
                 continue;
             }
 
-            match self.parse_node(raw_map, raw_name, &mut declared) {
+            self.node_override.apply(&mut raw_map);
+            let raw_name = raw_map.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            match self.parse_node(&raw_map, raw_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
@@ -1312,7 +1375,7 @@ impl ProxyProvider {
                 // built-in plugin transport missing from this build, stop
                 // the daemon from starting at all.
                 Err(e) => {
-                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(&raw_map) {
                         let label = if raw_name.is_empty() {
                             "<unnamed>"
                         } else {
