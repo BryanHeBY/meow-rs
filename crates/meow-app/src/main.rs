@@ -235,6 +235,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     meow_config::set_external_plugins_allowed(!args.no_external_plugins);
     meow_config::set_providers_require_https(args.providers_require_https);
+    if args.providers_require_https {
+        // A desktop must not hold its control plane on a slow feed. The
+        // engine registers empty providers and retries them in the background.
+        meow_config::set_provider_fetch_deadline(Some(std::time::Duration::from_millis(250)));
+    }
 
     // Hard-error on unsupported flags instead of silently ignoring them.
     if args.post_up.is_some() {
