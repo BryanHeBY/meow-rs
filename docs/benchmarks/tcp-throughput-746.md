@@ -1,5 +1,10 @@
 # TCP throughput follow-up (#746)
 
+This page describes the harness and results at the revision recorded below.
+The later [profile experiment](performance-profile.md) adds content checks and
+a concurrent-flow workload; its timings are not directly comparable to these
+historical samples.
+
 Issue [#746](https://github.com/meow-rs/meow-rs/issues/746) asks why the
 0.21.2 README snapshot puts 1 MiB × 10 about 2% behind mihomo and
 4 KiB × 10,000 about 1% behind. Repeated comparisons of current 0.22.0

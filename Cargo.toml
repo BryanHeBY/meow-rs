@@ -43,6 +43,12 @@ opt-level = 3
 [profile.release.package.shadowsocks]
 opt-level = 3
 
+# Opt-in desktop/mobile experiment; the normal release and router size gate
+# continue to use the size-optimized release profile above.
+[profile.performance]
+inherits = "release"
+opt-level = 3
+
 # Profile for dhat heap profiling — keeps debug symbols, no strip, no LTO.
 [profile.dhat]
 inherits = "release"
