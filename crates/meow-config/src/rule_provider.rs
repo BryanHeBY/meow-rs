@@ -754,7 +754,8 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                         let slots = MAX_CONCURRENT_RULE_DOWNLOADS - tasks.len();
                         for (index, d) in downloads.by_ref().take(slots) {
                             let task = tasks.spawn(async move {
-                                internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
+                                internal_http::fetch_provider(&d.url, d.proxy.as_ref(), &d.headers)
+                                    .await
                             });
                             indexes.insert(task.id(), index);
                         }
@@ -1975,7 +1976,7 @@ pub(crate) async fn fetch_http_async(
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
-    internal_http::fetch(url, proxy, headers).await
+    internal_http::fetch_provider(url, proxy, headers).await
 }
 
 fn write_cache(path: &Path, bytes: &[u8]) -> bool {

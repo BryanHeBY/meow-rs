@@ -14834,3 +14834,9 @@ mod listener_surface_tests {
         .unwrap();
     }
 }
+
+// This CLI-level option is intentionally opt-in; general Meow downloads and
+// existing third-party callers retain their established behaviour.
+pub fn set_providers_require_https(enabled: bool) {
+    internal_http::set_providers_require_https(enabled);
+}

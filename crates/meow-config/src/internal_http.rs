@@ -159,6 +159,43 @@ pub async fn fetch(
         .map(|response| response.body)
 }
 
+/// Process-wide policy for native proxy/rule provider downloads. Disabled by
+/// default so ordinary standalone Meow preserves its existing compatibility.
+static PROVIDERS_REQUIRE_HTTPS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable HTTPS-only redirects and origin-scoped headers for provider feeds.
+/// Set before starting the runtime and never change while it is running.
+pub fn set_providers_require_https(enabled: bool) {
+    PROVIDERS_REQUIRE_HTTPS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) async fn fetch_provider_response(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Response> {
+    fetch_capped_policy(
+        url,
+        proxy,
+        headers,
+        MAX_BODY_BYTES,
+        false,
+        PROVIDERS_REQUIRE_HTTPS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .await
+}
+
+pub(crate) async fn fetch_provider(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>> {
+    fetch_provider_response(url, proxy, headers)
+        .await
+        .map(|response| response.body)
+}
+
 /// [`fetch`], returning the response header fields along with the body.
 pub async fn fetch_response(
     url: &str,
@@ -219,28 +256,37 @@ async fn fetch_capped(
     limit: usize,
     direct_fallback: bool,
 ) -> Result<Response> {
-    let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL: {e}"))?;
+    fetch_capped_policy(url, proxy, headers, limit, direct_fallback, false).await
+}
+
+async fn fetch_capped_policy(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+    limit: usize,
+    direct_fallback: bool,
+    https_only: bool,
+) -> Result<Response> {
+    let mut current = Url::parse(url).map_err(|_| anyhow!("invalid URL"))?;
     let mut headers = headers.to_vec();
     for attempt in 0..=MAX_REDIRECTS {
+        // Check before *every* dial, including redirects. Do not include the
+        // URL in the error, since it may contain subscription credentials.
+        if https_only
+            && (current.scheme() != "https"
+                || current.host_str().is_none()
+                || !current.username().is_empty()
+                || current.password().is_some())
+        {
+            bail!("provider download requires HTTPS without URL user information");
+        }
         match fetch_one(&current, proxy, &headers, limit).await {
             Ok(Outcome::Body(response)) => return Ok(response),
             Ok(Outcome::Redirect(next)) => {
                 let next = current
                     .join(&next)
                     .map_err(|e| anyhow!("bad redirect Location: {e}"))?;
-                if current.origin() != next.origin() {
-                    headers.retain(|(name, _)| {
-                        ![
-                            "authorization",
-                            "cookie",
-                            "cookie2",
-                            "proxy-authorization",
-                            "www-authenticate",
-                        ]
-                        .iter()
-                        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
-                    });
-                }
+                retain_redirect_headers(&current, &next, &mut headers, https_only);
                 current = next;
             }
             Err(e) => {
@@ -258,6 +304,34 @@ async fn fetch_capped(
         }
     }
     bail!("too many redirects (> {MAX_REDIRECTS})")
+}
+
+fn retain_redirect_headers(
+    current: &Url,
+    next: &Url,
+    headers: &mut Vec<(String, String)>,
+    https_only: bool,
+) {
+    if current.origin() == next.origin() {
+        return;
+    }
+    if https_only {
+        // Any user-supplied header may carry credentials; defaults are added
+        // separately by fetch_one after this policy has run.
+        headers.clear();
+    } else {
+        headers.retain(|(name, _)| {
+            ![
+                "authorization",
+                "cookie",
+                "cookie2",
+                "proxy-authorization",
+                "www-authenticate",
+            ]
+            .iter()
+            .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+        });
+    }
 }
 
 enum Outcome {
@@ -655,6 +729,40 @@ pub fn first_named_proxy(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_provider_rejects_plain_http_before_dial() {
+        let error = super::fetch_capped_policy(
+            "http://127.0.0.1:9/private-token",
+            None,
+            &[],
+            1024,
+            false,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires HTTPS"));
+        assert!(!error.contains("private-token"));
+    }
+
+    #[test]
+    fn managed_provider_redirects_scope_all_configured_headers() {
+        let a = super::Url::parse("https://a.example/feed").unwrap();
+        let same = super::Url::parse("https://a.example/next").unwrap();
+        let other = super::Url::parse("https://b.example/next").unwrap();
+        let values = vec![
+            ("X-Token".into(), "private".into()),
+            ("User-Agent".into(), "x".into()),
+        ];
+        let mut same_values = values.clone();
+        super::retain_redirect_headers(&a, &same, &mut same_values, true);
+        assert_eq!(same_values, values);
+        let mut changed = values;
+        super::retain_redirect_headers(&a, &other, &mut changed, true);
+        assert!(changed.is_empty());
+    }
+
     use super::*;
     use crate::test_support::{Dial, ScriptedProxy};
 

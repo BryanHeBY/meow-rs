@@ -125,6 +125,10 @@ struct Args {
     #[arg(long)]
     no_external_plugins: bool,
 
+    /// Require HTTPS for all remote proxy and rule providers, including redirects.
+    #[arg(long)]
+    providers_require_https: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -230,6 +234,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     meow_config::set_external_plugins_allowed(!args.no_external_plugins);
+    meow_config::set_providers_require_https(args.providers_require_https);
 
     // Hard-error on unsupported flags instead of silently ignoring them.
     if args.post_up.is_some() {
