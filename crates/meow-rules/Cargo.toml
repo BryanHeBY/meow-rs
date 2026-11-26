@@ -35,6 +35,10 @@ harness = false
 name = "ipcidr_ruleset_bench"
 harness = false
 
+[[bench]]
+name = "classical_mixed_bench"
+harness = false
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
