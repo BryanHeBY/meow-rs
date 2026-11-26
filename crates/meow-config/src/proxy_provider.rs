@@ -735,7 +735,7 @@ impl ProxyProvider {
                         return Err(format!("proxy-provider '{}': {e:#}", self.name));
                     }
                 };
-                let response = crate::internal_http::fetch_response(
+                let response = crate::internal_http::fetch_provider_response(
                     url,
                     download_proxy.as_ref(),
                     &self.header,
