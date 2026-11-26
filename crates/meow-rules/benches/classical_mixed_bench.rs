@@ -20,6 +20,18 @@
 //! iteration checks one query. Layout and the number of rules visited both
 //! change by design. Timings alone cannot isolate window overhead, establish
 //! causation, or predict performance for real provider datasets.
+//!
+//! The separate miss matrix holds 32,768 alternating exact/suffix literals
+//! and one nonmatching DST-PORT predicate fixed. It crosses one contiguous
+//! domain window versus 128 windows with 128 versus 512 repetitions of that
+//! predicate. In the chunked layout, each 256-literal window is followed by
+//! one or four port rules; in the contiguous layout all port rules follow
+//! the literals. A miss visits every window and fallback. Late exact/suffix
+//! hits are reported separately: they exit before the last chunk's port rules
+//! in the chunked layout and before all port rules in the contiguous layout.
+//! The matrix contrasts window and fallback costs, but interactions, cache
+//! locality, working-set size, and benchmark ordering can confound timings;
+//! the late-hit results do not control the number of fallbacks visited.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use meow_common::{Metadata, Rule, RuleMatchHelper};
@@ -226,5 +238,114 @@ fn bench_classical_positions(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_classical_mixed, bench_classical_positions);
+fn bench_classical_miss_matrix(c: &mut Criterion) {
+    const LITERALS: usize = 32_768;
+    const CHUNK: usize = 256;
+    const CHUNKS: usize = LITERALS / CHUNK;
+    const PORT: &str = "DST-PORT,4242";
+
+    let mut group = c.benchmark_group("classical_provider_miss_matrix");
+    for layout in ["contiguous", "chunked"] {
+        for fallback_count in [128usize, 512] {
+            let mut entries = Vec::with_capacity(LITERALS + fallback_count);
+            let mut reference: Vec<Box<dyn Rule>> = Vec::with_capacity(entries.capacity());
+            for chunk in 0..CHUNKS {
+                for i in chunk * CHUNK..(chunk + 1) * CHUNK {
+                    let host = format!("r{i}.bench.test");
+                    if i % 2 == 0 {
+                        entries.push(format!("DOMAIN,{host}"));
+                        reference.push(Box::new(DomainRule::new(&host, "DIRECT")));
+                    } else {
+                        entries.push(format!("DOMAIN-SUFFIX,{host}"));
+                        reference.push(Box::new(DomainSuffixRule::new(&host, "DIRECT")));
+                    }
+                }
+                if layout == "chunked" {
+                    for _ in 0..fallback_count / CHUNKS {
+                        entries.push(PORT.to_owned());
+                        reference.push(Box::new(PortRule::new("4242", "DIRECT", false).unwrap()));
+                    }
+                }
+            }
+            if layout == "contiguous" {
+                for _ in 0..fallback_count {
+                    entries.push(PORT.to_owned());
+                    reference.push(Box::new(PortRule::new("4242", "DIRECT", false).unwrap()));
+                }
+            }
+
+            assert_eq!(entries.len(), LITERALS + fallback_count);
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| entry.as_str() == PORT)
+                    .count(),
+                fallback_count
+            );
+            assert_eq!(reference.len(), entries.len());
+            let set = build_rule_set_checked(
+                RuleSetBehavior::Classical,
+                &entries,
+                &ParserContext::empty(),
+            )
+            .unwrap();
+            assert_eq!(set.len(), entries.len());
+
+            for (position, hosts, expected) in [
+                ("miss", vec!["missing.bench.test".to_owned()], false),
+                (
+                    "late_hit",
+                    vec![
+                        format!("r{}.bench.test", LITERALS - 2),
+                        format!("sub.r{}.bench.test", LITERALS - 1),
+                    ],
+                    true,
+                ),
+            ] {
+                let queries: Vec<_> = hosts
+                    .into_iter()
+                    .map(|host| Metadata {
+                        host: host.into(),
+                        dst_port: 443,
+                        ..Default::default()
+                    })
+                    .collect();
+                for metadata in &queries {
+                    let ordered = reference
+                        .iter()
+                        .any(|rule| rule.match_metadata(metadata, &RuleMatchHelper));
+                    assert_eq!(
+                        ordered, expected,
+                        "reference: {layout} {fallback_count} {position}"
+                    );
+                    assert_eq!(
+                        set.matches(metadata, &RuleMatchHelper),
+                        ordered,
+                        "provider: {layout} {fallback_count} {position}"
+                    );
+                }
+
+                group.throughput(Throughput::Elements(queries.len() as u64));
+                group.bench_function(
+                    BenchmarkId::new(format!("{layout}_{fallback_count}"), position),
+                    |b| {
+                        b.iter(|| {
+                            for metadata in &queries {
+                                black_box(set.matches(black_box(metadata), &RuleMatchHelper));
+                            }
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_classical_mixed,
+    bench_classical_positions,
+    bench_classical_miss_matrix
+);
 criterion_main!(benches);
