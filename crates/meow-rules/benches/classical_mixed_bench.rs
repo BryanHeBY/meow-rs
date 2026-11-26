@@ -13,6 +13,13 @@
 //! set; entries and parser context are prepared outside the timed loop.
 //! The ordered reference checks only the provider's observable boolean,
 //! not which internal rule matched first.
+//!
+//! The position comparison uses the large corpus in two layouts: separated
+//! literal windows, or all literals followed by the same separators. Each
+//! early/middle/late iteration checks one exact and one suffix hit; a miss
+//! iteration checks one query. Layout and the number of rules visited both
+//! change by design. Timings alone cannot isolate window overhead, establish
+//! causation, or predict performance for real provider datasets.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use meow_common::{Metadata, Rule, RuleMatchHelper};
@@ -145,5 +152,79 @@ fn bench_classical_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_classical_mixed);
+fn bench_classical_positions(c: &mut Criterion) {
+    const LITERALS: usize = 32_768;
+    let mut group = c.benchmark_group("classical_provider_positions");
+    for layout in ["contiguous", "separated"] {
+        let (entries, reference) = corpus(LITERALS);
+        let (entries, reference) = if layout == "contiguous" {
+            // Every complete block contains 256 literals and four separators.
+            // Keep both representations in the same order as we move all
+            // separators after the literals, without changing their counts.
+            let (mut literals, separators): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .zip(reference)
+                .enumerate()
+                .partition(|(index, _)| index % 260 < 256);
+            literals.extend(separators);
+            literals.into_iter().map(|(_, pair)| pair).unzip()
+        } else {
+            (entries, reference)
+        };
+        let set = build_rule_set_checked(
+            RuleSetBehavior::Classical,
+            &entries,
+            &ParserContext::empty(),
+        )
+        .unwrap();
+        assert_eq!(set.len(), entries.len());
+        assert_eq!(reference.len(), entries.len());
+
+        for (position, index) in [
+            ("early", Some(0)),
+            ("middle", Some(LITERALS / 2)),
+            ("late", Some(LITERALS - 2)),
+            ("miss", None),
+        ] {
+            let hosts = match index {
+                Some(i) => vec![
+                    format!("r{i}.bench.test"),
+                    format!("sub.r{}.bench.test", i + 1),
+                ],
+                None => vec!["missing.bench.test".to_owned()],
+            };
+            let queries: Vec<_> = hosts
+                .into_iter()
+                .map(|host| Metadata {
+                    host: host.into(),
+                    dst_port: 443,
+                    ..Default::default()
+                })
+                .collect();
+            for metadata in &queries {
+                let ordered = reference
+                    .iter()
+                    .any(|rule| rule.match_metadata(metadata, &RuleMatchHelper));
+                assert_eq!(ordered, index.is_some(), "reference: {layout} {position}");
+                assert_eq!(
+                    set.matches(metadata, &RuleMatchHelper),
+                    ordered,
+                    "provider: {layout} {position}"
+                );
+            }
+
+            group.throughput(Throughput::Elements(queries.len() as u64));
+            group.bench_function(BenchmarkId::new(layout, position), |b| {
+                b.iter(|| {
+                    for metadata in &queries {
+                        black_box(set.matches(black_box(metadata), &RuleMatchHelper));
+                    }
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_classical_mixed, bench_classical_positions);
 criterion_main!(benches);
