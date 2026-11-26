@@ -155,8 +155,9 @@ dns:
 - **`prefer-h3` vs `?h3=true`.** The global flag means *prefer*: HTTP/3 is tried first
   and the query falls back to HTTP/2 / HTTP/1.1 DoH when the QUIC exchange fails, with the failed
   handshake parked for ten minutes so a server without HTTP/3 does not cost a handshake
-  timeout per query. `?h3=true` is mihomo's per-entry spelling and means *HTTP/3 only* —
-  no fallback. `?h3=prefer` opts a single entry into the fallback behaviour without the
+  timeout per query. `?h3=true` and the exact fragment `#h3=true` mean *HTTP/3 only* —
+  no fallback. The fragment alias occupies the SNI fragment slot; use `?h3=true#hostname`
+  when an explicit SNI is needed. Duplicate h3 settings are errors. `?h3=prefer` opts a single entry into the fallback behaviour without the
   global flag, and `?h3=false` turns the entry back off.
 - **`?proxy=`.** A proxied DoQ/DoH3 upstream dials the adapter's UDP association; an
   adapter that cannot carry UDP fails the exchange instead of leaking around the chain.
@@ -164,7 +165,7 @@ dns:
   the adapter, so the QUIC peer address is unknown until after the handshake — the config
   is refused at load rather than hanging every query.
 - **Builds.** The transports live behind the `dns-quic` Cargo feature (in the `full`
-  bundle, out of `minimal` for binary size). A config that asks for `quic://`, `?h3=` or
+  bundle, out of `minimal` for binary size). A config that asks for `quic://`, `?h3=`, `#h3=true` or
   `prefer-h3` on a build without it is a load error naming the feature — never a silent
   downgrade to plain DoH.
 

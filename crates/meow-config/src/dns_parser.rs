@@ -640,7 +640,12 @@ fn prefer_h3_url(raw: &str, prefer_h3: bool) -> String {
         return raw.to_string();
     }
     let trimmed = raw.trim();
-    if !trimmed.starts_with("https://") || has_h3_parameter(trimmed) {
+    if !trimmed.starts_with("https://")
+        || trimmed
+            .split_once('#')
+            .is_some_and(|(_, frag)| frag == "h3=true")
+        || has_h3_parameter(trimmed)
+    {
         return raw.to_string();
     }
     // Keep the `#sni` fragment last: the parameter section belongs to the
@@ -1717,6 +1722,10 @@ mod tests {
                 "https://1.1.1.1/dns-query?h3=true",
                 "https://1.1.1.1/dns-query?h3=true",
             ),
+            (
+                "https://1.1.1.1/dns-query?x=1#h3=true",
+                "https://1.1.1.1/dns-query?x=1#h3=true",
+            ),
             // A DoH path with its own query string: another `?` would be a
             // second parameter section, so the policy joins with `&`… the
             // parse below keeps one section and the path intact.
@@ -1732,6 +1741,25 @@ mod tests {
             assert_eq!(prefer_h3_url(raw, true), expected, "{raw}");
             // Off: verbatim.
             assert_eq!(prefer_h3_url(raw, false), raw, "{raw} (off)");
+        }
+    }
+
+    #[test]
+    fn prefer_h3_preserves_fragment_force() {
+        let raw = "https://1.1.1.1/dns-query?x=1#h3=true";
+        let entry = NameServerEntry::parse(&prefer_h3_url(raw, true)).unwrap();
+        assert!(
+            matches!(entry.url, meow_dns::NameServerUrl::Https { h3: meow_dns::H3Policy::Force, ref path, .. } if path == "/dns-query?x=1")
+        );
+        for raw in [
+            "https://1.1.1.1/dns-query?h3=false#h3=true",
+            "https://1.1.1.1/dns-query#h3=true&proxy=JP",
+            "https://1.1.1.1/dns-query#h3=false",
+        ] {
+            assert!(
+                NameServerEntry::parse(&prefer_h3_url(raw, true)).is_err(),
+                "{raw}"
+            );
         }
     }
 

@@ -75,7 +75,9 @@ not *require*:
 - the failed handshake parks h3 for 10 minutes, so a server without HTTP/3 pays
   one failed handshake instead of one per query.
 
-`?h3=true` keeps mihomo's per-entry meaning (HTTP/3 only, no fallback);
+`?h3=true` and the exact fragment `#h3=true` select HTTP/3 only, with no fallback.
+The fragment alias occupies the SNI slot; use `?h3=true#sni` for an explicit SNI.
+Duplicate h3 settings are errors;
 `?h3=prefer` and `?h3=false` are meow-rs spellings for per-entry opt-in/opt-out.
 
 ### Certificate handling
@@ -104,7 +106,7 @@ and absent from `minimal` for the ADR-0007 size caps). Without it:
 | `?h3=true` | HTTP/3 only | Same | — |
 | `prefer-h3` | Allowed alongside h1/h2 | Prefer, with a 10-minute park after a failed handshake | B |
 | `?h3=prefer` / `?h3=false` | Not a key | Per-entry opt-in / opt-out of `prefer-h3` | — |
-| `#h3=true` (mihomo writes params in the fragment) | Parameter | Hard error: `#` is SNI in meow-rs; the fix is `?h3=true` | A |
+| `#h3=true` | HTTP/3 only | Same, for the exact fragment on `https://` | — |
 | `?proxy=` on a QUIC entry whose server is a hostname | Works (the adapter resolves it) | Hard load error: quiche must know the peer before the handshake, and a proxied hostname hides it — a hung query otherwise | A |
 
 ## Testing

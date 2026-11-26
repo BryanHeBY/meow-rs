@@ -55,7 +55,7 @@ pub enum NameServerUrl {
 /// | (nothing) | [`H3Policy::Off`] |
 /// | `dns.prefer-h3: true` | [`H3Policy::Prefer`] on every `https://` entry |
 /// | `?h3=prefer` | [`H3Policy::Prefer`] on that entry |
-/// | `?h3=true` (mihomo spelling) | [`H3Policy::Force`], like mihomo |
+/// | `?h3=true` or exact `#h3=true` | [`H3Policy::Force`], like mihomo |
 ///
 /// `?h3=false` turns the entry back off, overriding `dns.prefer-h3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -185,18 +185,27 @@ impl NameServerEntry {
         // hostname).
         let is_encrypted_form =
             s.starts_with("tls://") || s.starts_with("https://") || s.starts_with("quic://");
-        let mut head: Cow<'_, str> = Cow::Borrowed(s);
+        // Only the entire, exact fragment is an alias. Other fragments retain
+        // their existing SNI validation, including multiple `#` characters.
+        let fragment_h3 = s.starts_with("https://")
+            && s.split_once('#').is_some_and(|(_, frag)| frag == "h3=true");
+        let input = if fragment_h3 {
+            &s[..s.len() - "#h3=true".len()]
+        } else {
+            s
+        };
+        let mut head: Cow<'_, str> = Cow::Borrowed(input);
         let mut query_proxy: Option<String> = None;
-        let mut query_h3: Option<H3Policy> = None;
+        let mut query_h3 = fragment_h3.then_some(H3Policy::Force);
         if is_encrypted_form {
-            if let Some(qidx) = s.rfind('?') {
+            if let Some(qidx) = input.rfind('?') {
                 // mihomo writes parameters into the `#` fragment, meow-rs
                 // writes them into a `?` section — a URL can therefore carry
                 // its SNI *after* the parameters (`?h3=true#dns.google`).
                 // Split the fragment off the section before validating keys,
                 // then re-attach it ahead of the `?` so the fragment rules
                 // below see it as SNI.
-                let after = &s[qidx + 1..];
+                let after = &input[qidx + 1..];
                 let (tail, trailing_frag) = match after.find('#') {
                     Some(idx) => (&after[..idx], Some(&after[idx..])),
                     None => (after, None),
@@ -297,8 +306,8 @@ impl NameServerEntry {
                     }
                     query_proxy = proxy_value.map(decode_proxy_name).transpose()?;
                     head = match trailing_frag {
-                        Some(frag) => Cow::Owned(format!("{}{frag}", &s[..qidx])),
-                        None => Cow::Borrowed(&s[..qidx]),
+                        Some(frag) => Cow::Owned(format!("{}{frag}", &input[..qidx])),
+                        None => Cow::Borrowed(&input[..qidx]),
                     };
                 }
             }
@@ -333,10 +342,8 @@ impl NameServerEntry {
                         "invalid SNI fragment '#{frag}' in '{s}'"
                     )));
                 }
-                // A DNS name never contains '=', so a fragment that does is
-                // the mihomo spelling of a per-entry parameter (`#h3=true`).
-                // `#` is SNI in meow-rs: say so instead of failing the TLS
-                // handshake on a nonsense server name later.
+                // Other fragments containing '=' are not valid SNI or the
+                // exact supported HTTP/3 alias.
                 if frag.contains('=') {
                     return Err(NameServerParseError::InvalidParams(format!(
                         "invalid SNI fragment '#{frag}' in '{s}' — '#' is SNI on \
@@ -1170,17 +1177,64 @@ mod tests {
         }
     }
 
-    /// `#h3=true` is the mihomo spelling of a per-entry parameter; `#` is SNI
-    /// here, so the fragment is refused with the fix spelled out.
     #[test]
     #[cfg(feature = "encrypted")]
-    fn entry_h3_in_fragment_is_refused() {
-        match NameServerEntry::parse("https://dns.google/dns-query#h3=true") {
-            Err(NameServerParseError::InvalidParams(msg)) => {
-                assert!(msg.contains("'?' section"), "got: {msg}");
-            }
-            other => panic!("must be InvalidParams, got {other:?}"),
+    fn entry_h3_fragment_alias() {
+        for (raw, path, proxy) in [
+            ("https://dns.google/dns-query#h3=true", "/dns-query", None),
+            (
+                "https://dns.google/dns-query?x=1&y=%2F#h3=true",
+                "/dns-query?x=1&y=%2F",
+                None,
+            ),
+            (
+                "https://dns.google/dns-query?x=1?proxy=JP#h3=true",
+                "/dns-query?x=1",
+                Some("JP"),
+            ),
+        ] {
+            let entry = NameServerEntry::parse(raw).unwrap();
+            assert_eq!(entry.proxy.as_deref(), proxy);
+            assert!(
+                matches!(entry.url, NameServerUrl::Https { h3: H3Policy::Force, path: ref p, ref sni, .. } if p == path && sni == "dns.google"),
+                "{raw}: {:?}",
+                entry.url
+            );
+            assert_eq!(
+                NameServerEntry::parse(&entry.url.to_string()).unwrap().url,
+                entry.url
+            );
         }
+        for raw in [
+            "https://dns.google/dns-query?h3=true#h3=true",
+            "https://dns.google/dns-query?h3=false#h3=true",
+        ] {
+            assert!(
+                matches!(NameServerEntry::parse(raw), Err(NameServerParseError::InvalidParams(msg)) if msg.contains("duplicate 'h3'")),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://dns.google/dns-query#h3=false",
+            "https://dns.google/dns-query#H3=true",
+            "https://dns.google/dns-query#h3=true&proxy=JP",
+            "https://dns.google/dns-query#h3=true#other",
+            "https://dns.google/dns-query#h3=true?proxy=JP",
+            "tls://dns.google#h3=true",
+            "quic://dns.google#h3=true",
+        ] {
+            assert!(
+                matches!(
+                    NameServerEntry::parse(raw),
+                    Err(NameServerParseError::InvalidParams(_))
+                ),
+                "{raw}"
+            );
+        }
+        let sni = NameServerEntry::parse("https://1.1.1.1/dns-query?h3=true#dns.google").unwrap();
+        assert!(
+            matches!(sni.url, NameServerUrl::Https { h3: H3Policy::Force, ref sni, .. } if sni == "dns.google")
+        );
     }
 
     /// `quic://` carries the same proxy tag and SNI slot as the other
