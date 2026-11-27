@@ -3044,6 +3044,34 @@ pub async fn reconcile_dns_config(
     prior_resolver: Option<Arc<meow_dns::Resolver>>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
+    reconcile_dns_config_with_fallback_geoip(
+        raw_config,
+        candidate,
+        config_path,
+        proxies,
+        rule_providers,
+        prefetched_payloads,
+        prior_resolver,
+        dialer_registry,
+        None,
+    )
+    .await
+}
+
+/// Reconcile DNS for an embedder using a private prepared fallback GeoIP database.
+/// A supplied reader represents a new effective input even if YAML is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile_dns_config_with_fallback_geoip(
+    raw_config: &RwLock<RawConfig>,
+    candidate: &RawConfig,
+    config_path: Option<&str>,
+    proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    rule_providers: Option<&HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    prefetched_payloads: Option<&Arc<meow_config::rule_provider::PrefetchedPayloads>>,
+    prior_resolver: Option<Arc<meow_dns::Resolver>>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
+    prepared: Option<&meow_config::PreparedFallbackGeoIp>,
+) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -3061,13 +3089,13 @@ pub async fn reconcile_dns_config(
             && !dns_uses_runtime_refs(&old)
             && !dns_uses_runtime_refs(candidate)
     };
-    if unchanged {
+    if unchanged && prepared.is_none() {
         return Ok(None);
     }
     let cache_dir = config_path
         .filter(|p| !p.is_empty())
         .map(meow_config::resource_cache_dir_for_config_path);
-    meow_config::parse_dns_from_raw(
+    meow_config::parse_dns_from_raw_with_fallback_geoip(
         candidate,
         cache_dir.as_deref(),
         proxies,
@@ -3075,6 +3103,7 @@ pub async fn reconcile_dns_config(
         prefetched_payloads,
         prior_resolver.as_deref(),
         dialer_registry,
+        prepared,
     )
     .await
     .map(Some)

@@ -1,6 +1,7 @@
 use crate::raw::{RawConfig, RawHosts};
 use crate::rule_provider::RuleProvider;
 use crate::DnsConfig;
+use anyhow::Context;
 use meow_common::DnsMode;
 use meow_dns::fakeip::{FileStore, MemoryStore, Pool, Skipper, SkipperMode, Store};
 use meow_dns::resolver::{
@@ -20,6 +21,75 @@ use tracing::warn;
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
 pub(crate) const DEFAULT_FAKE_IP_RANGE_V4: &str = "198.18.0.1/16";
 
+/// Embedders may provide a local Country database as owned bytes. This is
+/// deliberately not a YAML option; inherited configurations use the normal
+/// geodata lookup and its existing warn-and-continue behavior.
+#[derive(Clone)]
+pub struct PreparedFallbackGeoIp(Arc<maxminddb::Reader<Vec<u8>>>);
+
+impl PreparedFallbackGeoIp {
+    const MAX_BYTES: usize = 128 * 1024 * 1024;
+
+    pub fn from_bytes(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes.len() <= Self::MAX_BYTES,
+            "fallback GeoIP database exceeds size limit"
+        );
+        let reader = maxminddb::Reader::from_source(bytes)?;
+        reader.verify()?;
+        // Database type labels are vendor-specific. Require actual Country
+        // records, rather than accepting an ASN-only database with a
+        // well-formed search tree or hard-coding a brand in metadata.
+        let mut has_country = false;
+        for result in reader.networks(Default::default())?.take(4096) {
+            let lookup = result?;
+            if lookup
+                .decode::<maxminddb::geoip2::Country>()
+                .ok()
+                .flatten()
+                .and_then(|record| record.country.iso_code)
+                .is_some_and(valid_country_code)
+            {
+                has_country = true;
+                break;
+            }
+        }
+        anyhow::ensure!(
+            has_country,
+            "fallback GeoIP database has no compatible Country records"
+        );
+        Ok(Self(Arc::new(reader)))
+    }
+
+    pub(crate) fn check_config(&self, raw: &RawConfig) -> anyhow::Result<()> {
+        let dns = raw
+            .dns
+            .as_ref()
+            .context("prepared fallback GeoIP requires enabled DNS")?;
+        anyhow::ensure!(
+            dns.enable == Some(true) && dns.fallback.as_ref().is_some_and(|pool| !pool.is_empty()),
+            "prepared fallback GeoIP requires a nonempty fallback DNS pool"
+        );
+        let filter = dns
+            .fallback_filter
+            .as_ref()
+            .context("prepared fallback GeoIP requires an explicit filter")?;
+        anyhow::ensure!(
+            filter.geoip == Some(true)
+                && filter
+                    .geoip_code
+                    .as_ref()
+                    .is_some_and(|code| valid_country_code(code)),
+            "prepared fallback GeoIP requires geoip: true and a two-letter uppercase country"
+        );
+        Ok(())
+    }
+}
+
+fn valid_country_code(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase())
+}
+
 /// `prior` is the resolver generation being replaced (config reload); its
 /// fake-IP pool is carried over when the configured range and store
 /// identity (in-memory vs the same backing file) are unchanged, so clients
@@ -34,6 +104,33 @@ pub async fn parse_dns(
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
     prior: Option<&Resolver>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    parse_dns_with_fallback_geoip(
+        raw,
+        mmdb_path,
+        cache_dir,
+        proxy_registry,
+        geosite,
+        rule_providers,
+        prior,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn parse_dns_with_fallback_geoip(
+    raw: &RawConfig,
+    mmdb_path: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+    proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    geosite: Option<Arc<meow_rules::geosite::GeositeDB>>,
+    rule_providers: &HashMap<String, Arc<RuleProvider>>,
+    prior: Option<&Resolver>,
+    prepared: Option<&PreparedFallbackGeoIp>,
+) -> Result<DnsConfig, anyhow::Error> {
+    if let Some(prepared) = prepared {
+        prepared.check_config(raw)?;
+    }
     validate_node_policy_sources(raw)?;
     // `strict` (top-level `strict: true`, issue #533): static config defects
     // become hard errors; transient resolution failures stay lenient.
@@ -342,9 +439,14 @@ pub async fn parse_dns(
     } else {
         let raw_filter = dns.fallback_filter.clone();
         let mmdb_path = mmdb_path.map(std::path::Path::to_path_buf);
+        let prepared = prepared.cloned();
         Some(
             crate::spawn_blocking_with_current_dispatcher(move || {
-                build_fallback_filter(raw_filter.as_ref(), mmdb_path.as_deref(), strict)
+                if let Some(prepared) = prepared {
+                    build_fallback_filter_inner(raw_filter.as_ref(), None, strict, Some(prepared))
+                } else {
+                    build_fallback_filter(raw_filter.as_ref(), mmdb_path.as_deref(), strict)
+                }
             })
             .await
             .map_err(|e| anyhow::anyhow!("fallback-filter build task failed: {e}"))??,
@@ -1384,6 +1486,15 @@ fn build_fallback_filter(
     explicit_mmdb_path: Option<&std::path::Path>,
     strict: bool,
 ) -> Result<FallbackFilter, anyhow::Error> {
+    build_fallback_filter_inner(raw, explicit_mmdb_path, strict, None)
+}
+
+fn build_fallback_filter_inner(
+    raw: Option<&crate::raw::RawFallbackFilter>,
+    explicit_mmdb_path: Option<&std::path::Path>,
+    strict: bool,
+    prepared: Option<PreparedFallbackGeoIp>,
+) -> Result<FallbackFilter, anyhow::Error> {
     let geoip = raw.and_then(|f| f.geoip).unwrap_or(true);
     let geoip_code = raw
         .and_then(|f| f.geoip_code.clone())
@@ -1435,7 +1546,9 @@ fn build_fallback_filter(
     }
 
     // Attempt to load GeoIP MMDB for the geoip gate.
-    let geoip_reader = if geoip {
+    let geoip_reader = if let Some(prepared) = prepared {
+        Some(prepared.0)
+    } else if geoip {
         let mmdb_path =
             explicit_mmdb_path.map_or_else(crate::default_geoip_path, std::path::PathBuf::from);
         match std::fs::read(&mmdb_path)
@@ -1698,6 +1811,10 @@ async fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
     }
     out.into_iter().collect()
 }
+
+#[cfg(test)]
+#[path = "prepared_fallback_geoip_tests.rs"]
+mod prepared_fallback_geoip_tests;
 
 #[cfg(test)]
 mod tests {

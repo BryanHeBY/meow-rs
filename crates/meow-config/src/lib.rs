@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod dns_parser;
+pub use dns_parser::PreparedFallbackGeoIp;
 mod dns_proxy;
 mod dns_response_rules;
 pub mod dropped_providers;
@@ -2206,6 +2207,34 @@ pub async fn parse_dns_from_raw(
     prior_resolver: Option<&meow_dns::Resolver>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    parse_dns_from_raw_with_fallback_geoip(
+        raw,
+        cache_dir,
+        proxy_registry,
+        rule_providers,
+        prefetched_payloads,
+        prior_resolver,
+        dialer_registry,
+        None,
+    )
+    .await
+}
+
+/// Parse DNS for a candidate generation, optionally using a private prepared database.
+#[allow(clippy::too_many_arguments)]
+pub async fn parse_dns_from_raw_with_fallback_geoip(
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+    proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    rule_providers: Option<&HashMap<String, Arc<rule_provider::RuleProvider>>>,
+    prefetched_payloads: Option<&Arc<rule_provider::PrefetchedPayloads>>,
+    prior_resolver: Option<&meow_dns::Resolver>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
+    prepared: Option<&PreparedFallbackGeoIp>,
+) -> Result<DnsConfig, anyhow::Error> {
+    if let Some(prepared) = prepared {
+        prepared.check_config(raw)?;
+    }
     dns_parser::validate_node_policy_sources(raw)?;
     let geo = geodata::parse_geodata(raw)?;
     let empty = rule_provider::PrefetchedPayloads::default();
@@ -2240,7 +2269,7 @@ pub async fn parse_dns_from_raw(
     let bound_proxies =
         dialer_registry.map(|generation| dns_proxy::registry(proxy_registry, generation));
     let proxy_registry = bound_proxies.as_ref().unwrap_or(proxy_registry);
-    let dns = dns_parser::parse_dns(
+    let dns = dns_parser::parse_dns_with_fallback_geoip(
         raw,
         geo.mmdb_path.as_deref(),
         cache_dir,
@@ -2248,6 +2277,7 @@ pub async fn parse_dns_from_raw(
         ctx.geosite,
         &rule_providers,
         prior_resolver,
+        prepared,
     )
     .await?;
     Ok(dns)
@@ -4654,9 +4684,17 @@ pub struct GeoDataNeeds {
 /// ([`collect_geo_scan_lines`]). `pub(crate)` — `build_config` stores the
 /// result on [`Config::geo_needs`] for the auto-update loop.
 pub(crate) fn geo_references(raw: &raw::RawConfig, scan_lines: &[String]) -> GeoDataNeeds {
+    geo_references_with_fallback_source(raw, scan_lines, false)
+}
+
+fn geo_references_with_fallback_source(
+    raw: &raw::RawConfig,
+    scan_lines: &[String],
+    prepared: bool,
+) -> GeoDataNeeds {
     GeoDataNeeds {
         mmdb: scan_lines.iter().any(|l| line_references_geoip(l))
-            || dns_fallback_filter_uses_geoip(raw),
+            || (!prepared && dns_fallback_filter_uses_geoip(raw)),
         asn: scan_lines.iter().any(|l| line_references_asn(l)),
         geosite: scan_lines.iter().any(|l| line_references_geosite(l))
             || dns_policy_uses_geosite(raw),
@@ -5017,12 +5055,29 @@ async fn ensure_geodata(
     map: Option<&HashMap<SmolStr, Arc<dyn Proxy>>>,
     chained_providers: &std::collections::HashSet<String>,
 ) {
+    ensure_geodata_with_needs(
+        raw,
+        geo,
+        geo_references(raw, scan_lines),
+        map,
+        chained_providers,
+    )
+    .await;
+}
+
+async fn ensure_geodata_with_needs(
+    raw: &raw::RawConfig,
+    geo: &GeoDataConfig,
+    needs: GeoDataNeeds,
+    map: Option<&HashMap<SmolStr, Arc<dyn Proxy>>>,
+    chained_providers: &std::collections::HashSet<String>,
+) {
     if is_offline_validate() {
         // Validate local databases when present; missing databases use empty
         // indexes for structural checks and are fetched only at real startup.
         return;
     }
-    let downloads = missing_geodata_downloads(geo, geo_references(raw, scan_lines));
+    let downloads = missing_geodata_downloads(geo, needs);
     if downloads.is_empty() {
         return;
     }
@@ -8029,6 +8084,24 @@ pub async fn build_config(
     raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
+    build_config_with_optional_fallback_geoip(raw, cache_dir, None).await
+}
+
+/// Build an effective config with a private, already verified Country database.
+pub async fn build_config_with_fallback_geoip(
+    raw: raw::RawConfig,
+    cache_dir: Option<&Path>,
+    prepared: &PreparedFallbackGeoIp,
+) -> Result<Config, anyhow::Error> {
+    prepared.check_config(&raw)?;
+    build_config_with_optional_fallback_geoip(raw, cache_dir, Some(prepared)).await
+}
+
+async fn build_config_with_optional_fallback_geoip(
+    raw: raw::RawConfig,
+    cache_dir: Option<&Path>,
+    prepared: Option<&PreparedFallbackGeoIp>,
+) -> Result<Config, anyhow::Error> {
     dns_parser::validate_node_policy_sources(&raw)?;
     // `global-ua` (issue #974): validate, then install the process-global
     // *before* any provider/subscription/geodata/ECH fetch below emits a
@@ -8045,7 +8118,7 @@ pub async fn build_config(
     // live (issue #974 review).
     let previous_ua = meow_common::global_ua();
     meow_common::set_global_ua(validate_global_ua(raw.global_ua.as_deref())?);
-    let built = build_config_inner(raw, cache_dir).await;
+    let built = build_config_inner(raw, cache_dir, prepared).await;
     if built.is_err() {
         meow_common::set_global_ua(previous_ua.as_deref());
     }
@@ -8059,6 +8132,7 @@ pub async fn build_config(
 async fn build_config_inner(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
+    prepared: Option<&PreparedFallbackGeoIp>,
 ) -> Result<Config, anyhow::Error> {
     // Local shape/range gates BEFORE any candidate network work (issue
     // #974): a defect in `ntp:`/`keep-alive-*`/`tcp-*`/`listeners:`/`tun:`
@@ -8271,11 +8345,11 @@ async fn build_config_inner(
     let geo_scan_lines = collect_geo_scan_lines(&raw, &provider_payloads);
     // The same reference verdict gates the startup fetch and rides the
     // Config out to the auto-update loop — one judgment, two consumers.
-    let geo_needs = geo_references(&raw, &geo_scan_lines);
-    ensure_geodata(
+    let geo_needs = geo_references_with_fallback_source(&raw, &geo_scan_lines, prepared.is_some());
+    ensure_geodata_with_needs(
         &raw,
         &geodata,
-        &geo_scan_lines,
+        geo_needs,
         prefetch_proxies.as_deref().map(|p| &p.map),
         &chained_provider_names(&proxy_providers),
     )
@@ -8339,7 +8413,7 @@ async fn build_config_inner(
     // Bind DNS to the published generation rather than retaining pass-1 groups.
     // Weak targets avoid a resolver -> DIRECT -> resolver ownership cycle.
     let dns_proxies = dns_proxy::registry(&proxies, &dialer_registry);
-    let dns_config = dns_parser::parse_dns(
+    let dns_config = dns_parser::parse_dns_with_fallback_geoip(
         &raw,
         geodata.mmdb_path.as_deref(),
         cache_dir,
@@ -8347,6 +8421,7 @@ async fn build_config_inner(
         ctx.geosite.clone(),
         &rule_providers,
         None,
+        prepared,
     )
     .await?;
     // Bind the dns-outbound cell to the slot the embedder hands the
