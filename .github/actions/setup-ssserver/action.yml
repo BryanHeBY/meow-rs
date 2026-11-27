@@ -1,0 +1,35 @@
+name: Setup ssserver
+description: Restore or compile the pinned Shadowsocks interoperability peer.
+runs:
+  using: composite
+  steps:
+    - name: Identify ssserver compiler
+      id: compiler
+      shell: bash
+      run: |
+        echo "id=$(rustc -vV | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore ssserver
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/ci-ssserver/bin/ssserver
+        key: ssserver-ubuntu24-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.id }}-${{ hashFiles('.github/actions/setup-ssserver/action.yml') }}
+
+    - name: Compile ssserver from crates.io
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --registry crates-io shadowsocks-rust --version '=1.25.0' --bin ssserver --features "stream-cipher aead-cipher-2022" --locked --root "$RUNNER_TEMP/ci-ssserver"
+
+    - name: Check ssserver and expose it on PATH
+      shell: bash
+      run: |
+        "$RUNNER_TEMP/ci-ssserver/bin/ssserver" --version | grep -E '(^|[[:space:]])1\.25\.0([[:space:]]|$)'
+        echo "$RUNNER_TEMP/ci-ssserver/bin" >> "$GITHUB_PATH"
+
+    - name: Save ssserver
+      if: steps.cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.repository == 'BryanHeBY/meow-rs' && github.ref_name == github.event.repository.default_branch
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/ci-ssserver/bin/ssserver
+        key: ${{ steps.cache.outputs.cache-primary-key }}

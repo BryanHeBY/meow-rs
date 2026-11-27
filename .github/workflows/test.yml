@@ -3,9 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**", ".github/actions/setup-ssserver/**"]
   pull_request:
-    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**", ".github/actions/setup-ssserver/**"]
 
 # One active run per ref: a superseded push to the same PR/branch cancels the
 # in-flight run instead of racing it to completion. `push` is limited to
@@ -162,19 +162,8 @@ jobs:
         if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
-      - name: Cache ssserver binary
-        id: cache-ssserver
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/ssserver
-          key: ssserver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install ssserver
-        if: steps.cache-ssserver.outputs.cache-hit != 'true'
-        # --force: on a Cargo.lock change this step's cache misses, but the
-        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
-        # and a plain `cargo install` refuses to overwrite it.
-        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
+      - name: Set up pinned ssserver peer
+        uses: ./.github/actions/setup-ssserver
 
       - name: Install simple-obfs (obfs-local / obfs-server)
         run: |

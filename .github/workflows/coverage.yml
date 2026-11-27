@@ -80,20 +80,8 @@ jobs:
         if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Cache ssserver binary
-        id: cache-ssserver
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/ssserver
-          key: ssserver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install ssserver
-        if: steps.cache-ssserver.outputs.cache-hit != 'true'
-        # --force: on a Cargo.lock change this step's cache misses, but the
-        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
-        # and a plain `cargo install` refuses to overwrite it (same trap as
-        # test.yml's install step).
-        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
+      - name: Set up pinned ssserver peer
+        uses: ./.github/actions/setup-ssserver
 
       - name: Install simple-obfs
         run: |

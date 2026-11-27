@@ -25,9 +25,9 @@
 # binary.
 #
 # Deliberately NOT warmed here:
-# - ssserver (`cargo install shadowsocks-rust` in test.yml/coverage.yml):
-#   its key is Cargo.lock-hashed, so entries die on every dependency
-#   bump; a daily warm would mostly re-seed keys that are already stale.
+# - ssserver: its dedicated Ubuntu 24.04 action saves the verified peer
+#   immediately on demand in test.yml and coverage.yml. Do not add a
+#   regular source build to the release-asset warm-up job.
 # - Swatinem/rust-cache entries: rust-cache manages its own restore/save
 #   lifecycle and restore-keys fallback chain — out-of-band saves under
 #   its derived keys would fight that scheme.
