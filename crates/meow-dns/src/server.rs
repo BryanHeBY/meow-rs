@@ -291,6 +291,10 @@ impl DnsServer {
             return Ok(Self::build_notimp(id, flags, arcount > 0));
         }
 
+        if resolver.suppress_wire_aaaa(qtype) {
+            return Ok(Self::suppress_valid_aaaa(id, data, flags, question_len));
+        }
+
         // Non-address queries (TXT, MX, SRV, HTTPS, SOA, PTR, …) go through
         // the same nameserver pipeline as A/AAAA — an `exclusive` policy
         // match first, then domain-gate → policy → main → fallback — and
@@ -379,7 +383,7 @@ impl DnsServer {
         // so clients don't wait for an upstream response that would be
         // filtered anyway. This comes *after* the hosts check so a hosts
         // override for the disabled family is still honored.
-        if qtype == 28 && !resolver.ipv6_enabled() {
+        if qtype == 28 && !resolver.dns_ipv6_enabled() {
             return Ok(Self::build_noerror_empty(id, data, flags, question_len));
         }
 
@@ -393,7 +397,7 @@ impl DnsServer {
         let lookup = if qtype == 1 {
             resolver.lookup_ipv4_result(&domain).await
         } else {
-            resolver.lookup_ipv6_result(&domain).await
+            resolver.lookup_dns_ipv6_result(&domain).await
         };
 
         Ok(match lookup {
@@ -477,6 +481,16 @@ impl DnsServer {
                 arcount > 0,
             )));
         }
+        // An explicit dns.ipv6 prohibition applies even to local answers.
+        // Omission keeps the historic hosts and response-rule precedence.
+        if resolver.suppress_wire_aaaa(qtype) {
+            return LocalAnswer::Answer(LocalResponse::plain(Self::suppress_valid_aaaa(
+                id,
+                data,
+                flags,
+                question_len,
+            )));
+        }
         // Response rules are checked BEFORE the A/AAAA gate: a REFUSED/
         // NODATA/static-address verdict on a generic qtype (TXT, MX, …)
         // is fully locally answerable, so it must never draw an upstream
@@ -551,7 +565,7 @@ impl DnsServer {
                         question_len,
                     )),
                 })
-            } else if qtype == 28 && !resolver.ipv6_enabled() {
+            } else if qtype == 28 && !resolver.dns_ipv6_enabled() {
                 LocalAnswer::Answer(LocalResponse::plain(Self::build_noerror_empty(
                     id,
                     data,
@@ -565,7 +579,7 @@ impl DnsServer {
                 let local = if qtype == 1 {
                     resolver.lookup_ipv4_local(&domain)
                 } else {
-                    resolver.lookup_ipv6_local(&domain)
+                    resolver.lookup_dns_ipv6_local(&domain)
                 };
                 match local {
                     crate::resolver::LocalLookup::Decided(lookup) => {
@@ -708,7 +722,7 @@ impl DnsServer {
                 // the same way, and unrelated glue keeps its hints. The
                 // ipv6 hint additionally drops whenever the client cannot
                 // use IPv6 anyway.
-                let strip_ipv6_hint = !resolver.ipv6_enabled();
+                let strip_ipv6_hint = !resolver.dns_ipv6_enabled();
                 for rec in l
                     .answers
                     .iter_mut()
@@ -816,6 +830,18 @@ impl DnsServer {
         }
 
         Ok(req)
+    }
+
+    /// Suppress only a well-formed AAAA request. The shared parser keeps
+    /// malformed records and unsupported EDNS versions on their normal
+    /// FORMERR/BADVERS paths, including on the inline/TUN entry point.
+    fn suppress_valid_aaaa(id: u16, query: &[u8], flags: u16, question_len: usize) -> Vec<u8> {
+        match Self::parse_request(query, question_len) {
+            Ok(req) => Self::response_message(&req, ResponseCode::NoError)
+                .to_vec()
+                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)),
+            Err(response) => response,
+        }
     }
 
     fn response_message(req: &Message, code: ResponseCode) -> Message {
@@ -2284,6 +2310,212 @@ mod tests {
             "low flag byte = RA=1, rcode=0 (NoError) — not NXDOMAIN"
         );
         assert_eq!(&resp[6..8], &[0x00, 0x00], "ANCOUNT must be zero");
+    }
+
+    #[tokio::test]
+    async fn wire_ipv6_override_is_independent_in_inline_and_async_paths() {
+        let addr: IpAddr = "2001:db8::53".parse().unwrap();
+        let query = sample_query(5, 28);
+        for (top, wire, answer) in [
+            (false, None, true), // Legacy hosts exception.
+            (true, None, true),
+            (false, Some(true), true),
+            (true, Some(false), false),
+        ] {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![addr]),
+            );
+            let mut resolver =
+                Resolver::new(Vec::new(), Vec::new(), DnsMode::Normal, hosts, true, top);
+            resolver.set_dns_ipv6(wire);
+            let LocalAnswer::Answer(inline) = DnsServer::try_answer_local(&query, &resolver) else {
+                panic!("hosts must be decided inline");
+            };
+            let async_reply = DnsServer::handle_query(&query, &resolver).await.unwrap();
+            assert_eq!(inline.response, async_reply);
+            assert_eq!(
+                u16::from_be_bytes([async_reply[6], async_reply[7]]),
+                u16::from(answer)
+            );
+            assert_eq!(
+                resolver.lookup_ipv6("example.com").await,
+                top.then_some(addr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_ipv6_override_validates_aaaa_edns_before_suppression() {
+        let valid = sample_edns_query(17, RecordType::AAAA, true);
+        let mut newer = Message::from_vec(&valid).unwrap();
+        newer.edns.as_mut().unwrap().set_version(1);
+        let mut truncated = valid.clone();
+        truncated.pop();
+        for (policy, expected_answers) in [(None, 1), (Some(true), 1), (Some(false), 0)] {
+            let mut resolver = empty_resolver();
+            resolver.set_dns_ipv6(policy);
+            // On omission the authored local AAAA rule still wins even
+            // if top-level IPv6 is off, as it did before the wire override.
+            resolver
+                .set_response_rules(vec![crate::response_policy::ResponseRule {
+                    matcher: Arc::new(|_| true),
+                    query_types: vec![28],
+                    action: ResponseAction::Address {
+                        address: "2001:db8::53".parse().unwrap(),
+                        ttl: 60,
+                    },
+                }])
+                .unwrap();
+            for (packet, code, answers) in [
+                (valid.clone(), 0u16, expected_answers),
+                (newer.to_vec().unwrap(), 16u16, 0),
+                (truncated.clone(), 1u16, 0),
+            ] {
+                let LocalAnswer::Answer(inline) = DnsServer::try_answer_local(&packet, &resolver)
+                else {
+                    panic!("expected inline answer for {policy:?}, rcode={code}");
+                };
+                let asynchronous = DnsServer::handle_query(&packet, &resolver).await.unwrap();
+                assert_eq!(inline.response, asynchronous);
+                let parsed = Message::from_vec(&asynchronous).unwrap();
+                assert_eq!(u16::from(parsed.metadata.response_code), code);
+                assert_eq!(parsed.answers.len(), answers);
+                if code != 1 {
+                    assert_eq!(parsed.edns.as_ref().unwrap().version(), 0);
+                }
+                if code == 0 {
+                    assert_eq!(parsed.queries[0].query_type, RecordType::AAAA);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_ipv6_off_keeps_real_v4_https_and_svcb_hints_with_aaaa_only_fake_rule() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        use hickory_proto::rr::RData;
+        for qtype in [RecordType::HTTPS, RecordType::SVCB] {
+            for (policy, keep_v4) in [(None, false), (Some(true), false), (Some(false), true)] {
+                let upstream = spawn_dns_responder(move |response| {
+                    let mut record = https_record_with_hints();
+                    if qtype == RecordType::SVCB {
+                        let RData::HTTPS(https) = &record.data else {
+                            unreachable!()
+                        };
+                        record.data = RData::SVCB(https.0.clone());
+                    }
+                    response.add_answer(record);
+                })
+                .await;
+                let mut resolver = Resolver::new(
+                    vec![upstream],
+                    vec![],
+                    DnsMode::FakeIp,
+                    meow_trie::DomainTrie::new(),
+                    false,
+                    false,
+                );
+                resolver.set_dns_ipv6(policy);
+                resolver.set_fakeip_v4(Arc::new(
+                    Pool::new(
+                        "198.18.0.0/16".parse().unwrap(),
+                        Arc::new(MemoryStore::new(16)),
+                    )
+                    .unwrap(),
+                ));
+                resolver.set_fakeip_v6(Arc::new(
+                    Pool::new(
+                        "fdfe:dcba:9877::/64".parse().unwrap(),
+                        Arc::new(MemoryStore::new(16)),
+                    )
+                    .unwrap(),
+                ));
+                resolver.set_fakeip_skipper(Skipper::new(
+                    &["example.com".into()],
+                    SkipperMode::BlackList,
+                ));
+                resolver
+                    .set_response_rules(vec![ResponseRule {
+                        matcher: Arc::new(|host| host == "example.com"),
+                        query_types: vec![28],
+                        action: ResponseAction::FakeIp,
+                    }])
+                    .unwrap();
+                let packet = sample_edns_query(43, qtype, false);
+                assert!(matches!(
+                    DnsServer::try_answer_local(&packet, &resolver),
+                    LocalAnswer::Upstream
+                ));
+                let wire = DnsServer::handle_query(&packet, &resolver).await.unwrap();
+                let reply = Message::from_vec(&wire).unwrap();
+                let params = match (qtype, &reply.answers[0].data) {
+                    (RecordType::HTTPS, RData::HTTPS(https)) => &https.0.svc_params,
+                    (RecordType::SVCB, RData::SVCB(svcb)) => &svcb.svc_params,
+                    _ => panic!("expected an actual {qtype:?} record"),
+                };
+                assert!(params.iter().any(|(key, _)| *key == SvcParamKey::Alpn));
+                assert!(!params.iter().any(|(key, _)| *key == SvcParamKey::Ipv6Hint));
+                assert_eq!(
+                    params.iter().any(|(key, _)| *key == SvcParamKey::Ipv4Hint),
+                    keep_v4,
+                    "{qtype:?} {policy:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_ipv6_true_asks_for_aaaa_over_the_unchanged_ipv4_transport() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let expected: IpAddr = "2001:db8::80".parse().unwrap();
+        let fixture = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, source) = socket.recv_from(&mut buf).await.unwrap();
+            let query = &buf[..n];
+            let request = Message::from_vec(query).unwrap();
+            assert_eq!(request.queries[0].query_type, RecordType::AAAA);
+            let response = DnsServer::build_response(
+                request.metadata.id,
+                query,
+                u16::from_be_bytes([query[2], query[3]]),
+                DnsServer::question_len_for_test(query),
+                28,
+                expected,
+                60,
+            );
+            socket.send_to(&response, source).await.unwrap();
+        });
+        let mut resolver = Resolver::new(
+            vec![addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            false,
+        );
+        let query = sample_query(9, 28);
+        // Omission with top-level false emits no AAAA and makes no request.
+        let old = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        assert_eq!(u16::from_be_bytes([old[6], old[7]]), 0);
+        resolver.set_dns_ipv6(Some(true));
+        assert!(matches!(
+            DnsServer::try_answer_local(&query, &resolver),
+            LocalAnswer::Upstream
+        ));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        let IpAddr::V6(expected_v6) = expected else {
+            unreachable!()
+        };
+        assert!(response.ends_with(&expected_v6.octets()));
+        // The wire lookup filled the AAAA cache, but the dialing API remains off.
+        assert!(resolver.lookup_ipv6("example.com").await.is_none());
+        fixture.await.unwrap();
     }
 
     #[tokio::test]

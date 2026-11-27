@@ -367,6 +367,8 @@ pub async fn parse_dns(
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    resolver.set_dns_ipv6(dns.ipv6);
+
     // Fake-IP wiring: only when enhanced-mode == fake-ip. Errors here are
     // fatal (Class A per ADR-0002) — a misconfigured fake-IP range would
     // silently fall back to the upstream resolver, which is a user-surprising
@@ -381,9 +383,9 @@ pub async fn parse_dns(
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
             })?;
-            if !crate::effective_ipv6(raw.ipv6) {
+            if !dns.ipv6.unwrap_or_else(|| crate::effective_ipv6(raw.ipv6)) {
                 warn!(
-                    "dns.fake-ip-range6 is set but 'ipv6' is disabled — the \
+                    "dns.fake-ip-range6 is set but DNS IPv6 is disabled — the \
                      pool installs yet AAAA queries never consult it"
                 );
             }
@@ -1846,6 +1848,47 @@ mod tests {
     fn build_hosts_trie_none_is_empty() {
         let trie = build_hosts_trie(None, false).unwrap();
         assert!(trie.search("example.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn wire_ipv6_config_controls_fake_aaaa_and_preserves_a() {
+        for (top, option, expected) in [
+            (false, "", false),
+            (true, "", true),
+            (false, "  ipv6: true\n", true),
+            (true, "  ipv6: false\n", false),
+        ] {
+            let yaml = format!(
+                "ipv6: {top}\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range6: 'fdfe:dcba:9877::/64'\n  nameserver: ['rcode://refused']\n{option}rules: ['MATCH,DIRECT']\n"
+            );
+            let config = crate::load_config_from_str(&yaml).await.unwrap();
+            assert_eq!(crate::effective_ipv6(config.raw.ipv6), top);
+            for (qtype, found) in [(1u8, true), (28u8, expected)] {
+                let wire = [
+                    0, 9, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, b'w', b'i', b'r', b'e', 4, b't', b'e',
+                    b's', b't', 0, 0, qtype, 0, 1,
+                ];
+                let reply = meow_dns::DnsServer::handle_query(&wire, &config.dns.resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    u16::from_be_bytes([reply[6], reply[7]]),
+                    u16::from(found),
+                    "{yaml}"
+                );
+                if found && qtype == 28 {
+                    let tail: [u8; 16] = reply[reply.len() - 16..].try_into().unwrap();
+                    assert_eq!(
+                        config
+                            .dns
+                            .resolver
+                            .reverse_lookup(std::net::Ipv6Addr::from(tail).into())
+                            .as_deref(),
+                        Some("wire.test")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

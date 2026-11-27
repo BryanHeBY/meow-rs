@@ -125,6 +125,7 @@ secret: ""
 # DNS
 dns:
   enable: true
+  # ipv6: false  # Optional DNS-only AAAA policy, separate from top-level IPv6.
   listen: 127.0.0.1:1053
   nameserver:
     - 8.8.8.8

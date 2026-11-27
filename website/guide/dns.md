@@ -15,13 +15,23 @@ dns:
 When the `dns` block is absent or `enable: false`, a minimal resolver (Google DNS) is
 still used internally so rules and proxies can resolve names.
 
+Set `dns.ipv6: false` to return empty NOERROR answers to AAAA queries, including
+local host records and DNS response rules, and to strip IPv6 address hints
+from forwarded HTTPS/SVCB records. Set it to `true` to allow AAAA answers even
+when top-level `ipv6` is false. In Fake-IP mode, ordinary AAAA synthesis still
+requires an IPv6 fake-IP pool. Omit `dns.ipv6` for the legacy behavior, including
+local AAAA entries taking precedence over the top-level setting.
+
+This override affects DNS answers, not outbound address selection, DNS upstream
+transport, or bootstrap reachability. It does not enable IPv6 forwarding.
+
 ## Fields
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enable` | bool | `false` | Start the built-in DNS server |
 | `listen` | string | — | DNS server bind address, e.g. `127.0.0.1:53` |
-| `ipv6` | bool | — | Allow AAAA answers |
+| `ipv6` | bool | inherited | Override whether DNS clients get AAAA answers, independently of top-level IPv6 |
 | `enhanced-mode` | string | `normal` | `normal` · `fake-ip` · `redir-host` |
 | `nameserver` | list | `[]` | Primary upstreams (defaults to `8.8.8.8` if empty) |
 | `fallback` | list | `[]` | Fallback upstreams (gated by `fallback-filter`) |

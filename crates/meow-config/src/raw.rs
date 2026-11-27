@@ -1488,6 +1488,11 @@ impl RawNftset {
 #[serde(rename_all = "kebab-case")]
 pub struct RawDns {
     pub enable: Option<bool>,
+    /// DNS-wire AAAA override. Omit to retain the top-level IPv6 behavior,
+    /// including the historical local hosts/response-rule exceptions.
+    /// This does not change addresses used by engine dials or DNS transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<bool>,
     /// Add answers of domains the rules route through the
     /// core to nftables sets (see `meow_common::nftset`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

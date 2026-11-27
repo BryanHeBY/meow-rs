@@ -340,6 +340,9 @@ pub struct Resolver {
     /// Whether IPv6 resolution is enabled. Driven by the top-level `ipv6`
     /// config flag and fixed at construction time.
     ipv6: bool,
+    /// Explicit response policy for incoming DNS wire AAAA questions.
+    /// Kept separate from internal proxy and destination resolution.
+    dns_ipv6: Option<bool>,
     /// Dedicated resolver built from `dns.direct-nameserver` (mihomo
     /// `DirectHostResolver`). Carried by this generation so a config swap
     /// replaces main and direct lookups together.
@@ -380,7 +383,7 @@ impl Resolver {
     pub(crate) fn response_fake_ip(&self, host: &str, qtype: u16) -> Option<IpAddr> {
         match qtype {
             1 => self.fakeip_v4.as_ref().map(|pool| pool.lookup(host)),
-            28 if self.ipv6 => self.fakeip_v6.as_ref().map(|pool| pool.lookup(host)),
+            28 if self.dns_ipv6_enabled() => self.fakeip_v6.as_ref().map(|pool| pool.lookup(host)),
             _ => None,
         }
     }
@@ -885,6 +888,7 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            dns_ipv6: None,
             direct: None,
         }
     }
@@ -1180,12 +1184,23 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            dns_ipv6: None,
             direct: None,
         })
     }
 
-    pub(crate) fn ipv6_enabled(&self) -> bool {
-        self.ipv6
+    /// Set the DNS ingress override before publishing this generation.
+    /// Does not change how internal resolver consumers dial addresses.
+    pub fn set_dns_ipv6(&mut self, policy: Option<bool>) {
+        self.dns_ipv6 = policy;
+    }
+
+    pub(crate) fn dns_ipv6_enabled(&self) -> bool {
+        self.dns_ipv6.unwrap_or(self.ipv6)
+    }
+
+    pub(crate) fn suppress_wire_aaaa(&self, qtype: u16) -> bool {
+        qtype == 28 && self.dns_ipv6 == Some(false)
     }
 
     /// The nameserver-policy matcher built from `dns.nameserver-policy`,
@@ -1639,8 +1654,12 @@ impl Resolver {
     /// The synchronously-decidable prefix of [`Self::lookup_ipv6_result`]:
     /// IPv6-disable short-circuit, hosts trie, fake-IP synthesis, and fresh
     /// cache entries (issue #515).
-    pub(crate) fn lookup_ipv6_local<'a>(&'a self, host: &'a str) -> LocalLookup<'a> {
-        if !self.ipv6 {
+    pub(crate) fn lookup_dns_ipv6_local<'a>(&'a self, host: &'a str) -> LocalLookup<'a> {
+        self.lookup_ipv6_local_for(host, self.dns_ipv6_enabled())
+    }
+
+    fn lookup_ipv6_local_for<'a>(&'a self, host: &'a str, enabled: bool) -> LocalLookup<'a> {
+        if !enabled {
             return LocalLookup::Decided(AddressLookupResult::NoData);
         }
         if self.use_hosts {
@@ -1684,8 +1703,17 @@ impl Resolver {
         LocalLookup::Upstream(host)
     }
 
-    pub(crate) async fn lookup_ipv6_result(&self, host: &str) -> AddressLookupResult {
-        let target = match self.lookup_ipv6_local(host) {
+    async fn lookup_ipv6_result(&self, host: &str) -> AddressLookupResult {
+        self.lookup_ipv6_result_for(host, self.ipv6).await
+    }
+
+    pub(crate) async fn lookup_dns_ipv6_result(&self, host: &str) -> AddressLookupResult {
+        self.lookup_ipv6_result_for(host, self.dns_ipv6_enabled())
+            .await
+    }
+
+    async fn lookup_ipv6_result_for(&self, host: &str, enabled: bool) -> AddressLookupResult {
+        let target = match self.lookup_ipv6_local_for(host, enabled) {
             LocalLookup::Decided(r) => return r,
             LocalLookup::Upstream(name) => name,
         };
@@ -2234,7 +2262,8 @@ impl Resolver {
             return false;
         }
         if self.response_rules.is_empty() {
-            return (self.fakeip_v4.is_some() || self.fakeip_v6.is_some())
+            return (self.fakeip_v4.is_some()
+                || (!self.suppress_wire_aaaa(28) && self.fakeip_v6.is_some()))
                 && !self.skipper_bypasses(host);
         }
         [
@@ -2243,10 +2272,14 @@ impl Resolver {
             // (lookup_ipv6_local), even without an explicit fake-ip rule.
             (
                 28,
-                self.ipv6 && (self.fakeip_v6.is_some() || self.fakeip_v4.is_some()),
+                self.dns_ipv6_enabled() && (self.fakeip_v6.is_some() || self.fakeip_v4.is_some()),
             ),
         ]
         .into_iter()
+        // Explicit dns.ipv6:false rejects AAAA before evaluating rules, so
+        // a dormant AAAA-only fake-IP rule cannot suppress real IPv4 hints.
+        // Omission still preserves the prior no-pool/legacy guard below.
+        .filter(|(qtype, _)| !self.suppress_wire_aaaa(*qtype))
         .any(|(qtype, enabled)| match self.response_action(host, qtype) {
             // A forced family without a pool answers NODATA. Real hints
             // must not bypass that decision, even if the other family was
