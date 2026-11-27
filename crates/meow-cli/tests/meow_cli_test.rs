@@ -77,6 +77,7 @@ impl Meow {
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
             ntp_reconcile: None,
+            managed_fallback_geoip: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),

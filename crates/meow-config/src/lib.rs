@@ -1996,6 +1996,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
         &meow_dns::new_dns_outbound_cell(),
         None,
         false,
+        false,
     )
 }
 
@@ -2077,6 +2078,7 @@ pub fn rebuild_from_raw_with_resolver(
         &dns_cell,
         shared_rule_providers,
         false,
+        false,
     )
 }
 
@@ -2111,6 +2113,46 @@ pub fn rebuild_from_raw_runtime(
     // resolve the same slot the running generation's leaves do.
     provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<RebuildResult, anyhow::Error> {
+    rebuild_from_raw_runtime_with_fallback_geoip(
+        raw,
+        resolver,
+        providers,
+        cache_dir,
+        provider_dialer_registry,
+        selection,
+        provider_dns_cell,
+        None,
+    )
+}
+
+/// Rebuild a managed runtime using the same private fallback Country reader
+/// as its resolver. The reader satisfies only the DNS fallback data need.
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild_from_raw_runtime_with_fallback_geoip(
+    raw: &raw::RawConfig,
+    resolver: Option<&meow_dns::ResolverSlot>,
+    providers: &HashMap<String, Arc<ProxyProvider>>,
+    cache_dir: Option<&Path>,
+    // The live provider-dialer cell — providers a commit materializes for
+    // newly declared defs must share the registry the tunnel republishes,
+    // or their `dialer-proxy` chains never resolve (issue #489). Pass
+    // `Config::provider_dialer_registry`.
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The running config's selection-persistence owner — the same
+    // SelectionBacking startup built, so a rebuilt group keeps the user's
+    // persisted pick and the PUT commit's epoch bump fences these groups'
+    // writers correctly (issue #974). Pass
+    // SelectionBacking::unpersisted() for embedders without a backing file.
+    selection: &meow_proxy::SelectionBacking,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // pass `Tunnel::dns_outbound_cell()` so leaves the candidate builds
+    // resolve the same slot the running generation's leaves do.
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
+    prepared: Option<&PreparedFallbackGeoIp>,
+) -> Result<RebuildResult, anyhow::Error> {
+    if let Some(prepared) = prepared {
+        prepared.check_config(raw)?;
+    }
     // This lane always runs on a blocking thread (spawn_blocking in the
     // API/subscription callers), so the lazy store open is safe inline.
     let store_selected = resolve_profile(raw).store_selected;
@@ -2129,6 +2171,7 @@ pub fn rebuild_from_raw_runtime(
         provider_dns_cell,
         None,
         true,
+        prepared.is_some(),
     )
 }
 
@@ -2158,6 +2201,7 @@ pub fn rebuild_from_raw_with_cache_dir(
         &meow_proxy::dialer::ProxyRegistry::default(),
         &dns_cell,
         None,
+        false,
         false,
     )
 }
@@ -4069,6 +4113,7 @@ fn rebuild_from_raw_impl(
     // (`rebuild_from_raw_runtime`); startup ensures it in `build_config`,
     // and validation/test rebuilds must not reach the network.
     fetch_geodata: bool,
+    prepared_fallback_geoip: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
     // `global-ua` gate first: an invalid UA is a Class A rejection for
     // every candidate — validate only; the live process-global is
@@ -4255,7 +4300,11 @@ fn rebuild_from_raw_impl(
                 ensure_geodata_blocking(
                     raw,
                     &geo,
-                    &collect_geo_scan_lines(raw, &payloads),
+                    geo_references_with_fallback_source(
+                        raw,
+                        &collect_geo_scan_lines(raw, &payloads),
+                        prepared_fallback_geoip,
+                    ),
                     &proxies,
                     &chained_provider_names(&candidate_providers),
                 );
@@ -4464,6 +4513,7 @@ async fn rebuild_from_raw_impl_async(
             &provider_dialer_registry,
             &provider_dns_cell,
             shared_providers,
+            false,
             false,
         )
     })
@@ -5048,6 +5098,7 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// logged as warnings — the subsequent parser-context build hard-errors on
 /// a missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
 /// a clear diagnostic.
+#[cfg(test)]
 async fn ensure_geodata(
     raw: &raw::RawConfig,
     geo: &GeoDataConfig,
@@ -5113,13 +5164,11 @@ async fn ensure_geodata_with_needs(
 fn ensure_geodata_blocking(
     raw: &raw::RawConfig,
     geo: &GeoDataConfig,
-    scan_lines: &[String],
+    needs: GeoDataNeeds,
     map: &HashMap<SmolStr, Arc<dyn Proxy>>,
     chained_providers: &std::collections::HashSet<String>,
 ) {
-    if is_offline_validate()
-        || missing_geodata_downloads(geo, geo_references(raw, scan_lines)).is_empty()
-    {
+    if is_offline_validate() || missing_geodata_downloads(geo, needs).is_empty() {
         return;
     }
     // Carry the scoped dispatcher onto the download thread so its warns
@@ -5133,10 +5182,10 @@ fn ensure_geodata_blocking(
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    rt.block_on(ensure_geodata(
+                    rt.block_on(ensure_geodata_with_needs(
                         raw,
                         geo,
-                        scan_lines,
+                        needs,
                         Some(map),
                         chained_providers,
                     ));

@@ -107,6 +107,8 @@ pub struct AppState {
     /// each accepted document's resolved service config; `None` for
     /// embedders/tests without a supervisor (issue #974).
     pub ntp_reconcile: Option<NtpReconcile>,
+    /// Embedder-owned reader for this run. None is the ordinary controller.
+    pub managed_fallback_geoip: Option<meow_config::PreparedFallbackGeoIp>,
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     /// The cell provider-sourced `dialer-proxy` targets resolve against.
@@ -2302,6 +2304,7 @@ async fn apply_raw_to_tunnel(
         state.provider_dialer_registry.clone(),
         state.tunnel.selection_backing(),
         state.tunnel.dns_outbound_cell(),
+        state.managed_fallback_geoip.clone(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -2340,7 +2343,7 @@ async fn apply_raw_to_tunnel(
     // against the freshly rebuilt proxy registry so circular
     // `proxy-server-nameserver` detection sees current names; a parse
     // failure rejects the whole mutation before anything is published.
-    let dns = reconcile_dns_config(
+    let dns = reconcile_dns_config_with_fallback_geoip(
         &state.raw_config,
         &raw,
         state.config_path.as_deref(),
@@ -2349,6 +2352,7 @@ async fn apply_raw_to_tunnel(
         Some(&prefetched_payloads),
         Some(state.tunnel.resolver()),
         Some(&dialer_registry),
+        state.managed_fallback_geoip.as_ref(),
     )
     .await?;
     // Snapshot the resolver being replaced before the commit — the swap
@@ -2421,6 +2425,16 @@ async fn commit_raw_candidate(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    // Structural dashboard mutations may rebuild providers/rule bindings,
+    // but never overwrite the Android-owned effective DNS or its inputs.
+    if state.managed_fallback_geoip.is_some()
+        && !dns_document_equal(&state.raw_config.read(), &candidate)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "DNS settings are managed by the app for this run".into(),
+        ));
+    }
     // The `PUT /configs` admission gates, conditionally (review #887): a
     // caller that rewrites a `tun:`-reconcile input fires the restart in
     // `swap_config_and_reconcile_tun` below, whose spawn re-parses `tun:`
@@ -2930,6 +2944,17 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// them at build time. Unmodelled `extra` keys ride the `==`s, so an
 /// unknown-key-only edit reads as a change — a safe over-trigger.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
+    let base = dns_document_equal(a, b);
+    if !base || !(dns_uses_runtime_refs(a) || dns_uses_runtime_refs(b)) {
+        return base;
+    }
+    a.proxies == b.proxies
+        && a.proxy_groups == b.proxy_groups
+        && a.rule_providers == b.rule_providers
+}
+
+/// Compare frozen DNS intent independently of mutable provider/route objects.
+fn dns_document_equal(a: &RawConfig, b: &RawConfig) -> bool {
     // A pure key reorder of `nameserver-policy` must read as a change —
     // `a.dns == b.dns` alone is order-insensitive for this section.
     fn policies(raw: &RawConfig) -> [Option<&meow_config::raw::RawNameserverPolicy>; 2] {
@@ -2986,18 +3011,12 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     };
     // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
     // same `parse_geodata` result, so it joins the DNS-input comparison.
-    let base = hosts_equal
+    hosts_equal
         && nsp_equal
         && dns_sections_equal
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
-        && a.geox_url == b.geox_url;
-    if !base || !(dns_uses_runtime_refs(a) || dns_uses_runtime_refs(b)) {
-        return base;
-    }
-    a.proxies == b.proxies
-        && a.proxy_groups == b.proxy_groups
-        && a.rule_providers == b.rule_providers
+        && a.geox_url == b.geox_url
 }
 
 /// Decide whether `candidate` requires a DNS rebuild, and if so parse it.
@@ -3334,6 +3353,7 @@ async fn rebuild_from_raw_runtime_async(
     // The tunnel's dns-outbound indirection — `type: dns` leaves the
     // candidate builds resolve the live slot through it (issue #974).
     provider_dns_cell: meow_dns::DnsOutboundCell,
+    managed_fallback_geoip: Option<meow_config::PreparedFallbackGeoIp>,
 ) -> Result<meow_config::RebuildResult, String> {
     // Carry the caller's tracing dispatcher into the rebuild thread — the
     // same propagation `spawn_blocking_with_current_dispatcher` applies
@@ -3342,7 +3362,7 @@ async fn rebuild_from_raw_runtime_async(
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
-            meow_config::rebuild_from_raw_runtime(
+            meow_config::rebuild_from_raw_runtime_with_fallback_geoip(
                 &raw,
                 Some(&resolver_slot),
                 &providers,
@@ -3350,6 +3370,7 @@ async fn rebuild_from_raw_runtime_async(
                 &provider_dialer_registry,
                 &selection,
                 &provider_dns_cell,
+                managed_fallback_geoip.as_ref(),
             )
         })
     })
@@ -5197,8 +5218,21 @@ struct PutConfigsBody {
 async fn put_configs(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
-    Json(body): Json<PutConfigsBody>,
+    request: axum::extract::Request,
 ) -> Response {
+    if state.managed_fallback_geoip.is_some() {
+        return reload_rejected(
+            StatusCode::CONFLICT,
+            "Configuration replacement is managed by the app for this run",
+        );
+    }
+    let Json(body): Json<PutConfigsBody> =
+        match <Json<PutConfigsBody> as axum::extract::FromRequest<_>>::from_request(request, &state)
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => return error.into_response(),
+        };
     let force = params.get("force").is_some_and(|v| v == "true");
 
     let yaml = match (body.path, body.payload) {
@@ -5576,6 +5610,7 @@ async fn put_configs(
         state.provider_dialer_registry.clone(),
         state.tunnel.selection_backing(),
         state.tunnel.dns_outbound_cell(),
+        None,
     )
     .await
     {
@@ -5602,6 +5637,7 @@ async fn put_configs(
                     state.provider_dialer_registry.clone(),
                     state.tunnel.selection_backing(),
                     state.tunnel.dns_outbound_cell(),
+                    None,
                 )
                 .await
                 {
@@ -7732,6 +7768,7 @@ mod outbound_flush_tests {
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
             ntp_reconcile: None,
+            managed_fallback_geoip: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -8061,6 +8098,7 @@ mod global_route_binding_tests {
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
             ntp_reconcile: None,
+            managed_fallback_geoip: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -8509,6 +8547,7 @@ mod anytls_listeners_api_tests {
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
             ntp_reconcile: None,
+            managed_fallback_geoip: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -8598,5 +8637,172 @@ mod anytls_listeners_api_tests {
         // `addresses` only disambiguates multi-address entries — a
         // single-address item stays byte-identical to other listeners.
         assert!(item.get("addresses").is_none(), "{item}");
+    }
+}
+
+#[cfg(test)]
+mod managed_fallback_geoip_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    // Built from the original core test generator at
+    // meow-config/tests/support/fallback_geoip_fixture.rs. Embed here so
+    // the API crate's tests remain self-contained outside the workspace.
+    const COUNTRY_DB: &[u8] = include_bytes!("../tests/fixtures/synthetic-fallback-country.mmdb");
+    const DOMESTIC: [u8; 4] = [192, 0, 2, 19];
+    const FOREIGN: [u8; 4] = [198, 51, 100, 23];
+
+    async fn serve(socket: tokio::net::UdpSocket, address: [u8; 4]) {
+        let mut buf = [0; 1536];
+        loop {
+            let (_n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let mut end = 12;
+            while buf[end] != 0 {
+                end += 1 + usize::from(buf[end]);
+            }
+            end += 5;
+            let mut reply = buf[..end].to_vec();
+            reply[2..4].copy_from_slice(&[0x81, 0x80]);
+            reply[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
+            reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            reply.extend_from_slice(&address);
+            socket.send_to(&reply, peer).await.unwrap();
+        }
+    }
+
+    async fn answer_ip(resolver: &meow_dns::Resolver, label: &str) -> [u8; 4] {
+        let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, label.len() as u8];
+        query.extend_from_slice(label.as_bytes());
+        query.extend_from_slice(b"\x04test\x00\x00\x01\x00\x01");
+        let reply = meow_dns::DnsServer::handle_query(&query, resolver)
+            .await
+            .unwrap();
+        assert_eq!(&reply[6..8], &[0, 1]);
+        reply[reply.len() - 4..].try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_fallback_geoip_blocks_replacement_but_keeps_warm_edits() {
+        let local = tempfile::tempdir().unwrap();
+        let db = local.path().join("Country.mmdb");
+        let primary = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "mode: rule\nipv6: false\ngeodata:\n  mmdb-path: '{}'\ndns:\n  enable: true\n  use-system-hosts: false\n  nameserver: ['udp://{}']\n  fallback: ['udp://{}']\n  fallback-filter: {{geoip: true, geoip-code: DE}}\nrules: ['MATCH,DIRECT']\n",
+            db.display(), primary.local_addr().unwrap(), fallback.local_addr().unwrap()
+        )).unwrap();
+        let primary_task = tokio::spawn(serve(primary, FOREIGN));
+        let fallback_task = tokio::spawn(serve(fallback, DOMESTIC));
+        let prepared = meow_config::PreparedFallbackGeoIp::from_bytes(COUNTRY_DB.to_vec()).unwrap();
+        let initial = meow_config::build_config_with_fallback_geoip(raw, None, &prepared)
+            .await
+            .unwrap();
+        let tunnel = Tunnel::new(Arc::clone(&initial.dns.resolver));
+        let raw = Arc::new(RwLock::new(initial.raw));
+        let factory = || {
+            crate::ApiServer::new(
+                tunnel.clone(),
+                None,
+                Some("test-managed".into()),
+                Default::default(),
+                None,
+                Arc::clone(&raw),
+                broadcast::channel(8).0,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                vec![],
+                None,
+                Default::default(),
+                Default::default(),
+                None,
+            )
+        };
+        let first = factory()
+            .with_managed_fallback_geoip(prepared.clone())
+            .router();
+        let second = factory().with_managed_fallback_geoip(prepared).router();
+        let unprepared = factory().router();
+        let request = |method, path, authorization, body: &'static str| {
+            let mut b = Request::builder().method(method).uri(path);
+            if authorization {
+                b = b.header("authorization", "Bearer test-managed");
+            }
+            b.header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let original = tunnel.resolver();
+        assert_eq!(answer_ip(&original, "before").await, DOMESTIC);
+        for router in [first.clone(), second] {
+            let denied = router
+                .clone()
+                .oneshot(request("PUT", "/configs", false, "{}"))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+            for path in ["/configs", "/configs?force=true"] {
+                let denied = router
+                    .clone()
+                    .oneshot(request("PUT", path, true, ""))
+                    .await
+                    .unwrap();
+                assert_eq!(denied.status(), StatusCode::CONFLICT);
+                assert!(Arc::ptr_eq(&original, &tunnel.resolver()));
+            }
+        }
+        // An unprepared server keeps its stock request validation behavior.
+        let stock = unprepared
+            .oneshot(request("PUT", "/configs", true, ""))
+            .await
+            .unwrap();
+        assert_eq!(stock.status(), StatusCode::BAD_REQUEST);
+        let patch = first
+            .clone()
+            .oneshot(request("PATCH", "/configs", true, r#"{"mode":"global"}"#))
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        assert!(Arc::ptr_eq(&original, &tunnel.resolver()));
+
+        let warm = first
+            .oneshot(request(
+                "POST",
+                "/rules/append",
+                true,
+                r#"{"rule":"DOMAIN,managed.test,DIRECT"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::NO_CONTENT);
+        assert!(!Arc::ptr_eq(&original, &tunnel.resolver()));
+        assert_eq!(answer_ip(&tunnel.resolver(), "after").await, DOMESTIC);
+        assert!(raw
+            .read()
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|r| r == "DOMAIN,managed.test,DIRECT"));
+        let dns = raw.read();
+        assert_eq!(
+            dns.dns
+                .as_ref()
+                .unwrap()
+                .fallback_filter
+                .as_ref()
+                .unwrap()
+                .geoip_code
+                .as_deref(),
+            Some("DE")
+        );
+        assert!(
+            !db.exists(),
+            "warm mutation must not provision fallback MMDB"
+        );
+        primary_task.abort();
+        fallback_task.abort();
     }
 }

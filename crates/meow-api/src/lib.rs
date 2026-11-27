@@ -362,9 +362,26 @@ impl ApiServer {
                 ui_storage: Default::default(),
                 provider_dialer_registry,
                 ntp_reconcile,
+                managed_fallback_geoip: None,
                 cors,
             }),
         }
+    }
+
+    /// Keep the embedder's private prepared Country reader authoritative on
+    /// this listener. The caller must pass the same reader used by the
+    /// running resolver and by any embedder-owned DNS mode changes.
+    #[must_use]
+    pub fn with_managed_fallback_geoip(
+        mut self,
+        prepared: meow_config::PreparedFallbackGeoIp,
+    ) -> Self {
+        // The server is consumed by this startup builder, before any router
+        // may borrow the state. Fail loudly if called after creating one.
+        Arc::get_mut(&mut self.state)
+            .expect("managed resolver context must be installed before constructing the API router")
+            .managed_fallback_geoip = Some(prepared);
+        self
     }
 
     /// A fresh router over the shared state — one per configured endpoint

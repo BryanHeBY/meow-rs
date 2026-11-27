@@ -176,6 +176,7 @@ fn fixture_state(secret: Option<&str>) -> AppState {
         dns_server: Default::default(),
         ui_storage: Default::default(),
         ntp_reconcile: None,
+        managed_fallback_geoip: None,
         cors: Default::default(),
     }
 }
