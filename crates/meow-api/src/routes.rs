@@ -3339,6 +3339,10 @@ pub async fn publish_dns(
     install_dns_publish(tunnel, dns_server, dns, plan);
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the blocking build adapter forwards distinct per-generation runtime handles"
+)]
 async fn rebuild_from_raw_runtime_async(
     raw: RawConfig,
     resolver_slot: meow_dns::ResolverSlot,
