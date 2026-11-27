@@ -383,11 +383,16 @@ pub async fn parse_dns(
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
             })?;
-            if !dns.ipv6.unwrap_or_else(|| crate::effective_ipv6(raw.ipv6)) {
-                warn!(
-                    "dns.fake-ip-range6 is set but DNS IPv6 is disabled — the \
+            match dns.ipv6 {
+                Some(false) => warn!(
+                    "dns.fake-ip-range6 is set but 'dns.ipv6' is disabled — the \
                      pool installs yet AAAA queries never consult it"
-                );
+                ),
+                None if !crate::effective_ipv6(raw.ipv6) => warn!(
+                    "dns.fake-ip-range6 is set but 'ipv6' is disabled — the \
+                     pool installs yet AAAA queries never consult it"
+                ),
+                _ => {}
             }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
@@ -2191,20 +2196,33 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             rt.block_on(async {
-                for (yaml, expected_pool) in [
-                    // Not fake-ip mode: the key is ignored outright.
+                let yaml = |top, fakeip, wire| {
+                    let mode = if fakeip { "  enhanced-mode: fake-ip\n" } else { "" };
+                    format!(
+                        "ipv6: {top}\ndns:\n  enable: true\n{mode}{wire}  nameserver: [rcode://refused]\n  fake-ip-range6: fdfe:dcba:9876::/64\n"
+                    )
+                };
+                for (yaml, expected_pool, expected_warning) in [
                     (
-                        "dns:\n  enable: true\n  nameserver: [rcode://refused]\n  fake-ip-range6: fdfe:dcba:9876::/64\n",
+                        yaml(false, false, ""),
                         false,
+                        Some("fake-ip-range6 is set but enhanced-mode is not 'fake-ip'"),
                     ),
-                    // fake-ip mode but `ipv6` unset: installs anyway — the
-                    // warn explains why it stays unreachable.
                     (
-                        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [rcode://refused]\n  fake-ip-range6: fdfe:dcba:9876::/64\n",
+                        yaml(false, true, ""),
                         true,
+                        Some("fake-ip-range6 is set but 'ipv6' is disabled"),
                     ),
+                    (
+                        yaml(true, true, "  ipv6: false\n"),
+                        true,
+                        Some("fake-ip-range6 is set but 'dns.ipv6' is disabled"),
+                    ),
+                    (yaml(false, true, "  ipv6: true\n"), true, None),
+                    (yaml(true, true, ""), true, None),
                 ] {
-                    let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
+                    sink.0.lock().unwrap().clear();
+                    let raw: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
                     let cfg = parse_dns(
                         &raw,
                         None,
@@ -2221,19 +2239,18 @@ mod tests {
                         expected_pool,
                         "{yaml}"
                     );
+                    let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+                    if let Some(warning) = expected_warning {
+                        assert!(captured.contains(warning), "{yaml}: {captured}");
+                    } else {
+                        assert!(
+                            !captured.contains("fake-ip-range6 is set but"),
+                            "{yaml}: {captured}"
+                        );
+                    }
                 }
             });
         });
-
-        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
-        assert!(
-            captured.contains("fake-ip-range6 is set but enhanced-mode is not 'fake-ip'"),
-            "non-fake-ip mode must warn the key is ignored; got: {captured}"
-        );
-        assert!(
-            captured.contains("fake-ip-range6 is set but 'ipv6' is disabled"),
-            "ipv6-off fake-ip mode must warn the pool is dead; got: {captured}"
-        );
     }
 
     /// Issue #514 review follow-up: a config reload that rebuilds the
