@@ -21,6 +21,7 @@ listener-tun = ["meow-listener/listener-tun"]
 [dependencies]
 meow-common = { workspace = true }
 meow-tunnel = { workspace = true }
+meow-transport = { workspace = true, features = ["tls"] }
 meow-dns = { workspace = true, default-features = false }
 meow-config = { workspace = true, default-features = false }
 meow-proxy = { workspace = true, default-features = false }
@@ -44,6 +45,7 @@ time = { workspace = true }
 base64 = "0.22"
 prometheus-client = "0.22"
 hickory-proto = { workspace = true }
+httparse = { version = "1", default-features = false }
 smol_str = { workspace = true }
 # Dual-stack controller binds clear IPV6_V6ONLY on the raw socket
 # (issue #974) — only the `api-tls` endpoint needs it.
@@ -71,6 +73,8 @@ windows-sys = { version = "0.60", features = [
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+boring = { workspace = true }
+tokio-boring = { workspace = true }
 serde-saphyr = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # api_test opens a logbook.

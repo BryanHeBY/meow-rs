@@ -61,6 +61,21 @@ impl ResolverHostHook {
     fn active(&self) -> &Arc<Resolver> {
         self.proxy_resolver.as_ref().unwrap_or(&self.resolver)
     }
+
+    async fn lookup(&self, host: &str) -> io::Result<Option<Vec<IpAddr>>> {
+        let resolver = self.active();
+        if meow_common::route_check::active() && resolver.has_proxied_upstreams() {
+            // A live lookup could traverse a group or re-enter the exact
+            // proxy being diagnosed. Hosts and cached addresses need no dial.
+            return resolver.resolve_ips_local(host).map(Some).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "route check requires unproxied DNS",
+                )
+            });
+        }
+        resolver.resolve_ips(host).await
+    }
 }
 
 #[async_trait]
@@ -70,7 +85,11 @@ impl HostResolver for ResolverHostHook {
         // `raw_os_error` (e.g. EMFILE opening the resolver socket), which
         // `is_local_resource_error` needs to see to keep local resource
         // exhaustion off the proxy-member health ledger (#682).
-        match self.active().resolve_ip(host).await {
+        match self
+            .lookup(host)
+            .await
+            .map(|ips| ips.and_then(|ips| ips.into_iter().next()))
+        {
             Ok(Some(ip)) => Ok(ip),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -81,7 +100,7 @@ impl HostResolver for ResolverHostHook {
     }
 
     async fn resolve_all(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        match self.active().resolve_ips(host).await {
+        match self.lookup(host).await {
             Ok(Some(ips)) => Ok(ips),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::NotFound,

@@ -2256,6 +2256,10 @@ async fn run(
     if let Some(ref tls_addr) = config.api.external_controller_tls {
         warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
     }
+    // The controller can serve while the startup TUN changes the active
+    // outbound path. Publish its diagnostic generation once that settles.
+    let startup_route_publication = (cfg!(feature = "listener-tun") && config.tun.enable)
+        .then(meow_common::route_check::publishing);
     if api_endpoint_servable(&config.api) {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
@@ -2491,6 +2495,8 @@ async fn run(
             warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
         }
     }
+
+    drop(startup_route_publication);
 
     // Start the NTP worker now that routing, the resolver hook, and any
     // TUN binding are settled — its own dial may ride the tunnel.

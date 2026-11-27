@@ -7,6 +7,7 @@ pub mod cors;
 pub mod endpoint;
 pub mod log_stream;
 mod logbook;
+mod route_check;
 pub mod routes;
 mod storage;
 pub use storage::{UiStorage, UiStorageSlot};
@@ -95,6 +96,8 @@ pub(crate) type OutboundBinding = std::convert::Infallible;
 pub struct PreinstalledBinding {
     binding: Option<OutboundBinding>,
     interface_changed: bool,
+    #[cfg(feature = "listener-tun")]
+    _publication: Option<meow_common::route_check::Publication>,
 }
 
 impl PreinstalledBinding {
@@ -198,11 +201,14 @@ pub fn preinstall_global_route_binding(
     let Some(iface) = iface else {
         return PreinstalledBinding::default();
     };
+    let publication = matches!(scope, PreinstallScope::Mutation { .. })
+        .then(meow_common::route_check::publishing);
     let previous = meow_common::outbound_interface();
     match meow_listener::OutboundBinding::install(iface.as_deref()) {
         Ok(binding) => PreinstalledBinding {
             interface_changed: previous.as_deref() != Some(binding.interface()),
             binding: Some(binding),
+            _publication: publication,
         },
         Err(e) => {
             tracing::debug!(
@@ -414,16 +420,25 @@ impl ApiServer {
         &self,
         listener: tokio::net::TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let app = self.router();
-
-        let bound = listener
-            .local_addr()
-            .ok()
+        let local_addr = listener.local_addr().ok();
+        let bound = local_addr
             .or(self.listen_addr)
             .map_or_else(|| "<unknown>".to_string(), |a| a.to_string());
         info!("REST API listening on {bound}");
         info!("Web UI available at http://{bound}/ui");
-        axum::serve(listener, app).await?;
+        let app = self.router();
+        if local_addr.is_some_and(route_check::is_loopback) && self.state.auth_required() {
+            let app = app.layer(axum::Extension(Arc::new(
+                route_check::LoopbackController::new(),
+            )));
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        } else {
+            axum::serve(listener, app).await?;
+        }
         Ok(())
     }
 }

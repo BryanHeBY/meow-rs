@@ -414,6 +414,7 @@ pub async fn run_loop(
                             // through the standalone DNS server's or host
                             // hook's OLD resolver would fail closed until
                             // `publish_dns` runs (issue #533).
+                            let publication = meow_common::route_check::publishing();
                             if let Some(dns) = &dns {
                                 meow_api::routes::install_resolver_everywhere(
                                     &tunnel,
@@ -459,6 +460,7 @@ pub async fn run_loop(
                                 &name,
                             );
                             *raw_config.write() = candidate.clone();
+                            drop(publication);
                             if let Some(dns) = dns {
                                 meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), &dns)
                                     .await;

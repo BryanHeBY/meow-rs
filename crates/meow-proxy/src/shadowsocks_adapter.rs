@@ -1780,7 +1780,9 @@ impl ProxyAdapter for ShadowsocksAdapter {
         let internal = metadata.is_internal();
         let conn = self.core.dial_tcp_stream(addr.clone(), internal).await?;
         #[cfg(feature = "ss-obfs")]
-        if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
+        if !meow_common::route_check::active()
+            && matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. }))
+        {
             let core = Arc::clone(&self.core);
             // The redial fires later, from `FirstFlight`'s poll_read /
             // poll_write on the relay copy task — long after this dial's

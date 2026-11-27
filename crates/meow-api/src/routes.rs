@@ -279,9 +279,14 @@ async fn release_standalone_dns_for_tun(dns_server: &RwLock<Option<DnsServerHand
 pub static CONFIG_MUTATION: Mutex<()> = Mutex::const_new(());
 
 impl AppState {
-    fn auth_required(&self) -> bool {
+    pub(crate) fn auth_required(&self) -> bool {
         self.secret.as_deref().is_some_and(|s| !s.is_empty())
     }
+}
+
+pub(crate) fn token_matches(provided: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Auth middleware for all API routes. Accepts `Authorization: Bearer <secret>`
@@ -308,13 +313,7 @@ async fn require_auth_ws(
     };
     let provided = bearer.or(token_param);
 
-    let ok = match provided {
-        Some(t) if t.len() == expected.len() => {
-            use subtle::ConstantTimeEq;
-            t.as_bytes().ct_eq(expected.as_bytes()).into()
-        }
-        _ => false,
-    };
+    let ok = provided.is_some_and(|token| token_matches(token, expected));
     if ok {
         next.run(req).await
     } else {
@@ -517,6 +516,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/", get(hello))
         .route("/version", get(version))
+        .route("/api/unlock/check", post(crate::route_check::check))
         .route("/proxies", get(get_proxies))
         .route(
             "/proxies/{name}",
@@ -700,13 +700,26 @@ async fn hello() -> Json<HelloResponse> {
 struct VersionResponse {
     version: String,
     meta: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<crate::route_check::Capabilities>,
 }
 
-async fn version() -> Json<VersionResponse> {
-    Json(VersionResponse {
+async fn version(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let controller = crate::route_check::LoopbackController::authorized(&state, &req).ok();
+    let capabilities = controller.and_then(|controller| controller.capabilities());
+    let mut response = Json(VersionResponse {
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         meta: true,
+        capabilities,
     })
+    .into_response();
+    if controller.is_some() {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 #[derive(Serialize)]
@@ -1745,6 +1758,7 @@ fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
                 .into_response();
         }
     }
+    let _publication = meow_common::route_check::publishing();
     let mut raw = state.raw_config.write();
     if let Some(parsed_mode) = tail.mode {
         state.tunnel.set_mode(parsed_mode);
@@ -2804,6 +2818,7 @@ pub fn commit_proxy_providers(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    let _publication = meow_common::route_check::publishing();
     for (name, provider) in candidate {
         provider.set_strict(strict);
         // Reused providers may carry dead derived slots from failed
@@ -3095,6 +3110,7 @@ pub fn install_resolver_everywhere(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    let _publication = meow_common::route_check::publishing();
     tunnel.set_resolver(Arc::clone(&dns.resolver), dns.enabled);
 
     // Bind the dns-outbound indirection to the tunnel's live slot
@@ -4725,6 +4741,7 @@ async fn swap_config_and_reconcile_tun(
     let windows_local_dns =
         cfg!(target_os = "windows") && tun_wants_local_dns_bind(&candidate, &setup_resolver);
     let held_listen = state.dns_server.read().as_ref().map(|h| h.listen);
+    let _publication = meow_common::route_check::publishing();
     if dns_retire_conflicts_with_tun_bind(&dns_plan, tun_will_spawn, windows_local_dns, held_listen)
     {
         release_standalone_dns_for_tun(&state.dns_server).await;

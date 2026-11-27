@@ -44,6 +44,7 @@ pub mod outbound_iface;
 pub mod process_lookup;
 pub mod protocol_clock;
 pub mod replay_window;
+pub mod route_check;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;

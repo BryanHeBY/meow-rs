@@ -1398,6 +1398,7 @@ impl ProxyProvider {
     /// strict-gated initial load in [`load_proxy_providers`].
     fn commit(&self, proxies: Vec<Arc<dyn Proxy>>) {
         info!(provider = %self.name, count = proxies.len(), "proxy-provider refreshed");
+        let _publication = meow_common::route_check::publishing();
         // Main slot first, then the derived views — readers can never
         // observe new derived contents against a stale main slot.
         *self.slot.write() = proxies;

@@ -2217,6 +2217,7 @@ impl Tunnel {
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) {
+        let _publication = meow_common::route_check::publishing();
         // Preserve the current rules + index via Arc refcount bumps. Held
         // as a single write section so a concurrent `update_rules` cannot
         // be lost.
@@ -2302,6 +2303,7 @@ impl Tunnel {
             dialer_registry,
             Some(&self.route_snapshot()),
         ));
+        let _publication = meow_common::route_check::publishing();
         let mut generation = self.inner.tcp_generation.write();
         *generation = generation.checked_add(1).expect("TCP generation exhausted");
         let closed = self
@@ -2368,6 +2370,7 @@ impl Tunnel {
     where
         I: IntoIterator<Item = Arc<dyn Proxy>>,
     {
+        let _publication = meow_common::route_check::publishing();
         let route = self.inner.route();
         let adapters = meow_common::reset_sessions_reachable(
             route.proxies.values().cloned().chain(extra_roots),
@@ -2411,6 +2414,7 @@ impl Tunnel {
 
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
         let needs_ip = route.needs_ip_resolution();
+        let _publication = meow_common::route_check::publishing();
         // Publish inside the write hold so registry and route table swap
         // linearly — a concurrent installer can otherwise leave the registry
         // naming proxies the live route map already dropped (issue #489

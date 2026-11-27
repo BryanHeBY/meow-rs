@@ -391,6 +391,14 @@ impl Resolver {
     pub fn main_nameservers(&self) -> &[Arc<DnsClient>] {
         &self.main
     }
+
+    pub(crate) fn has_proxied_upstreams(&self) -> bool {
+        self.main
+            .iter()
+            .chain(self.fallback.iter().flatten())
+            .chain(self.policy.iter().flat_map(NameserverPolicy::clients))
+            .any(|client| client.is_proxied())
+    }
 }
 
 enum HostsLookup<'a> {
