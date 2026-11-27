@@ -56,7 +56,30 @@ jobs:
           cache: npm
           cache-dependency-path: tests/dashboard/package-lock.json
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      - name: Install Playwright Chromium and OS dependencies
+        run: |
+          set -euo pipefail
+          # Playwright runs apt-get update itself. Its dependencies are in the
+          # Ubuntu archives; an outage of the runner's unrelated Microsoft
+          # repository must not prevent the browser tests from running.
+          vendor=/etc/apt/sources.list.d/microsoft-prod.list
+          if [ -f "$vendor" ] && awk '
+            /^[[:space:]]*(#|$)/ { next }
+            /^[[:space:]]*deb[[:space:]]+(\[[^]]+\][[:space:]]+)?https:\/\/packages\.microsoft\.com\/ubuntu\/24\.04\/prod\/?[[:space:]]+noble([[:space:]]|$)/ { found = 1; next }
+            { other = 1 }
+            END { exit !(found && !other) }
+          ' "$vendor"; then
+            backup="$(mktemp -d "$RUNNER_TEMP/playwright-apt.XXXXXX")"
+            restore_source() {
+              if [ -e "$backup/microsoft-prod.list" ]; then
+                sudo mv -- "$backup/microsoft-prod.list" "$vendor"
+              fi
+              rmdir -- "$backup"
+            }
+            trap restore_source EXIT
+            sudo mv -- "$vendor" "$backup/microsoft-prod.list"
+          fi
+          npx --no-install playwright install --with-deps chromium
       - name: Dashboard unit and browser tests
         run: npm test
       - name: Upload browser failure traces
