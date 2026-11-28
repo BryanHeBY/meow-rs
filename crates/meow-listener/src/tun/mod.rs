@@ -872,13 +872,19 @@ impl TunListener {
             let guard = match fake_ip_gateway {
                 Some(gateway) => {
                     let addrs = dns::GuardAddrs::new(gateway, used_addr);
-                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(addrs))
-                        .await
-                        .map_err(|join_err| {
-                            Box::new(io::Error::other(format!(
-                                "dns-guard spawn_blocking panicked: {join_err}"
-                            )))
-                        })?;
+                    // The blocking worker may finish after cancellation.
+                    // Keep this exact device alive until its DNS guard has
+                    // been transferred or dropped, so rollback cannot target
+                    // a replacement link.
+                    let dns_device = Arc::clone(&device);
+                    let (g, _dns_device) =
+                        tokio::task::spawn_blocking(move || (dns::DnsGuard::setup(addrs, if_index), dns_device))
+                            .await
+                            .map_err(|join_err| {
+                                Box::new(io::Error::other(format!(
+                                    "dns-guard spawn_blocking panicked: {join_err}"
+                                )))
+                            })?;
                     let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
                     let dns_active = g.is_some();
                     info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");

@@ -9,8 +9,9 @@
 //! the system DNS is set to those loopback addresses.
 //!
 //! `DnsGuard` backs up the current resolver configuration at startup,
-//! installs the DNS server addresses on all active adapters, and
-//! restores the original configuration on drop.
+//! installs the appropriate resolver settings and restores them on drop.
+//! On Linux with systemd-resolved, only the TUN link is configured; the
+//! managed resolver file and all physical interfaces remain untouched.
 //!
 //! Individual failures are logged and skipped: a DNS configuration error
 //! does not abort the TUN listener startup, and a recovery failure is
@@ -18,6 +19,15 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use tracing::{debug, warn};
+
+#[cfg(target_os = "linux")]
+mod resolved_linux;
+
+#[cfg(target_os = "linux")]
+enum LinuxRestore {
+    ResolvConf(linux::ResolvConfBackup),
+    Resolved(resolved_linux::LinkDns),
+}
 
 /// Where the guard points the OS resolver on macOS/Linux, and every
 /// address a run may have pointed it at.
@@ -59,7 +69,7 @@ pub(super) struct DnsGuard {
     #[cfg(target_os = "macos")]
     backup: Vec<(String, Vec<IpAddr>)>,
     #[cfg(target_os = "linux")]
-    backup: Option<linux::ResolvConfBackup>,
+    backup: Option<LinuxRestore>,
 }
 
 impl DnsGuard {
@@ -70,7 +80,9 @@ impl DnsGuard {
     /// On Windows `addrs` is ignored — the system DNS is always set
     /// to `127.0.0.1` (IPv4) and `::1` (IPv6) so queries reach the
     /// local DNS server (`tun/local_dns.rs`).
-    pub(super) fn setup(addrs: GuardAddrs) -> Option<Self> {
+    pub(super) fn setup(addrs: GuardAddrs, if_index: u32) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = if_index;
         #[cfg(target_os = "windows")]
         {
             let _ = (addrs.dns, addrs.own);
@@ -112,11 +124,25 @@ impl DnsGuard {
         #[cfg(target_os = "linux")]
         {
             let dns_addr = addrs.dns;
+            if resolved_linux::manages_system_dns() {
+                return match resolved_linux::LinkDns::install(if_index, dns_addr) {
+                    Ok(link) => {
+                        debug!("tun dns-guard: resolved DNS set to {dns_addr} on link {if_index}");
+                        Some(Self {
+                            backup: Some(LinuxRestore::Resolved(link)),
+                        })
+                    }
+                    Err(e) => {
+                        warn!("tun dns-guard: failed to configure systemd-resolved link {if_index}: {e}");
+                        None
+                    }
+                };
+            }
             match linux::backup_and_set(dns_addr) {
                 Ok(backup) => {
                     debug!("tun dns-guard: DNS set to {dns_addr} in /etc/resolv.conf");
                     Some(Self {
-                        backup: Some(backup),
+                        backup: Some(LinuxRestore::ResolvConf(backup)),
                     })
                 }
                 Err(e) => {
@@ -177,10 +203,14 @@ impl Drop for DnsGuard {
         #[cfg(target_os = "linux")]
         {
             if let Some(backup) = self.backup.take() {
-                if let Err(e) = linux::restore(&backup) {
-                    warn!("tun dns-guard: failed to restore /etc/resolv.conf: {e}");
+                let (backend, result) = match backup {
+                    LinuxRestore::ResolvConf(backup) => ("/etc/resolv.conf", linux::restore(&backup)),
+                    LinuxRestore::Resolved(link) => ("systemd-resolved link DNS", link.restore()),
+                };
+                if let Err(e) = result {
+                    warn!("tun dns-guard: failed to restore {backend}: {e}");
                 } else {
-                    debug!("tun dns-guard: /etc/resolv.conf restored");
+                    debug!("tun dns-guard: {backend} restored");
                 }
             }
         }
