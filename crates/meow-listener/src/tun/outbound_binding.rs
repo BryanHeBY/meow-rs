@@ -75,7 +75,24 @@ impl OutboundBinding {
                 ))
             })?,
         };
-        let guard = meow_common::install_outbound_interface(&iface).map_err(|e| {
+        Self::install_interface(&iface)
+    }
+
+    /// Wait only for Linux's automatically detected IPv4 default route.
+    /// An unreadable route table, an invalid explicit interface or a bind
+    /// failure is returned immediately. Dropping the future cancels the
+    /// wait; it owns no task and changes no routing state while waiting.
+    #[cfg(target_os = "linux")]
+    pub async fn install_for_startup(outbound_interface: Option<&str>) -> io::Result<Self> {
+        if let Some(name) = outbound_interface {
+            return Self::install_interface(name);
+        }
+        let iface = wait_for_linux_default(super::route::linux_default_interface).await?;
+        Self::install_interface(&iface)
+    }
+
+    fn install_interface(iface: &str) -> io::Result<Self> {
+        let guard = meow_common::install_outbound_interface(iface).map_err(|e| {
             io::Error::other(format!(
                 "tun auto-route (global scope): outbound interface binding failed ({e}); \
                  refusing to install default routes without loop avoidance"
@@ -95,6 +112,34 @@ impl OutboundBinding {
     /// rejected before its listener starts never gets here.
     pub fn commit(&self) {
         self.0.commit();
+    }
+}
+
+// Startup can race network-manager/DHCP after boot or reconnect. Keep
+// the window short and scoped to startup, never an API config transaction.
+#[cfg(target_os = "linux")]
+async fn wait_for_linux_default(
+    mut read: impl FnMut() -> io::Result<Option<String>>,
+) -> io::Result<String> {
+    use std::time::Duration;
+    use tokio::time::{sleep_until, Instant};
+
+    const LIMIT: Duration = Duration::from_secs(10);
+    const TICK: Duration = Duration::from_millis(250);
+    let deadline = Instant::now() + LIMIT;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no physical IPv4 default route appeared within 10s",
+            ));
+        }
+        if let Some(iface) = read()? {
+            return Ok(iface);
+        }
+        sleep_until((now + TICK).min(deadline)).await;
     }
 }
 
@@ -176,5 +221,74 @@ mod tests {
             "meow-tun-test".into(),
         )
         .with_outbound_binding(binding)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod startup_tests {
+    use super::{wait_for_linux_default, OutboundBinding};
+    use std::{cell::Cell, io, time::Duration};
+    use tokio::time::{advance, sleep, Instant};
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_waits_for_dhcp_without_opening_an_unbound_path() {
+        let start = Instant::now();
+        let bound = wait_for_linux_default(|| {
+            Ok((start.elapsed() >= Duration::from_secs(4)).then(|| "eth-test".into()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(bound, "eth-test");
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_and_permanent_errors_are_distinct() {
+        let start = Instant::now();
+        let err = wait_for_linux_default(|| Ok(None)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+
+        // NotFound from an unreadable /proc/net/route is different from a
+        // successful read that found no matching route.
+        let start = Instant::now();
+        let err = wait_for_linux_default(|| Err(io::ErrorKind::NotFound.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        assert!(
+            OutboundBinding::install_for_startup(Some("no-such-iface-test"))
+                .await
+                .is_err()
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_startup_cannot_observe_the_returning_route() {
+        let reads = Cell::new(0);
+        let ready = Cell::new(false);
+        let mut old = Box::pin(wait_for_linux_default(|| {
+            reads.set(reads.get() + 1);
+            Ok(ready.get().then(|| "eth-test".into()))
+        }));
+        tokio::select! {
+            result = &mut old => panic!("old launch completed unexpectedly: {result:?}"),
+            () = sleep(Duration::from_millis(600)) => {}
+        }
+        drop(old);
+        let reads_on_stop = reads.get();
+        assert!(reads_on_stop > 1);
+        ready.set(true);
+        advance(Duration::from_secs(4)).await;
+        assert_eq!(reads.get(), reads_on_stop);
+        assert_eq!(
+            wait_for_linux_default(|| Ok(ready.get().then(|| "eth-test".into())))
+                .await
+                .unwrap(),
+            "eth-test",
+        );
     }
 }

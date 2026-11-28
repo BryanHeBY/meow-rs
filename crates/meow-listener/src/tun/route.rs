@@ -69,8 +69,7 @@ impl Drop for RouteGuard {
 pub(super) fn default_interface() -> std::io::Result<String> {
     #[cfg(target_os = "linux")]
     {
-        let table = std::fs::read_to_string("/proc/net/route")?;
-        parse_default_interface(&table).ok_or_else(|| {
+        linux_default_interface()?.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no IPv4 default route found in /proc/net/route",
@@ -95,6 +94,13 @@ pub(super) fn default_interface() -> std::io::Result<String> {
              (Linux, macOS and Windows only; #375)",
         ))
     }
+}
+
+/// Distinguish normal absence during DHCP startup from failure to read
+/// the kernel's routing table. Only the former is eligible for retry.
+#[cfg(target_os = "linux")]
+pub(super) fn linux_default_interface() -> std::io::Result<Option<String>> {
+    std::fs::read_to_string("/proc/net/route").map(|table| parse_default_interface(&table))
 }
 
 /// The fields of a routing-table entry that decide default-interface

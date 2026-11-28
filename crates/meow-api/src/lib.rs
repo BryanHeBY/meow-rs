@@ -187,17 +187,7 @@ pub fn preinstall_global_route_binding(
     raw: &RawConfig,
     scope: PreinstallScope,
 ) -> PreinstalledBinding {
-    let iface = match scope {
-        PreinstallScope::Startup => meow_config::global_route_outbound_interface(raw.tun.as_ref())
-            .or_else(|| meow_config::named_tun_global_route_interface(raw)),
-        PreinstallScope::Mutation {
-            named_tun_running: false,
-        } => meow_config::global_route_outbound_interface(raw.tun.as_ref()),
-        // A running named TUN owns its binding until restart.
-        PreinstallScope::Mutation {
-            named_tun_running: true,
-        } => None,
-    };
+    let iface = requested_global_route_interface(raw, scope);
     let Some(iface) = iface else {
         return PreinstalledBinding::default();
     };
@@ -218,6 +208,39 @@ pub fn preinstall_global_route_binding(
             PreinstalledBinding::default()
         }
     }
+}
+
+#[cfg(feature = "listener-tun")]
+fn requested_global_route_interface(
+    raw: &RawConfig,
+    scope: PreinstallScope,
+) -> Option<Option<String>> {
+    match scope {
+        PreinstallScope::Startup => meow_config::global_route_outbound_interface(raw.tun.as_ref())
+            .or_else(|| meow_config::named_tun_global_route_interface(raw)),
+        PreinstallScope::Mutation {
+            named_tun_running: false,
+        } => meow_config::global_route_outbound_interface(raw.tun.as_ref()),
+        // A running named TUN owns its binding until restart.
+        PreinstallScope::Mutation {
+            named_tun_running: true,
+        } => None,
+    }
+}
+
+/// Linux process startup: finish binding before *any* outbound dial.
+/// Unlike an API mutation, startup has no existing listener that can
+/// keep serving while physical routing is unavailable.
+#[cfg(all(target_os = "linux", feature = "listener-tun"))]
+pub async fn wait_for_startup_global_route_binding(
+    raw: &RawConfig,
+) -> std::io::Result<Option<meow_listener::OutboundBinding>> {
+    let Some(iface) = requested_global_route_interface(raw, PreinstallScope::Startup) else {
+        return Ok(None);
+    };
+    meow_listener::OutboundBinding::install_for_startup(iface.as_deref())
+        .await
+        .map(Some)
 }
 
 /// Without the `listener-tun` feature no TUN can run, so there is never a

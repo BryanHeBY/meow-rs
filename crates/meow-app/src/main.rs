@@ -588,7 +588,6 @@ fn run_application_inner(
         .build()?;
 
     runtime.block_on(async move {
-        let early_binding: EarlyOutboundBinding;
         // --config-string replaces the config file as the source (mihomo
         // behavior); the flag overrides below apply on top of either source.
         //
@@ -664,15 +663,22 @@ fn run_application_inner(
         // PUT/PATCH re-assert at their commit points.
         meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(&raw)?);
 
+        // No process can reach irreversible TUN setup before its own
+        // startup await completes. The service still stops an unpublished
+        // Linux child by terminating it; no detached retry survives that.
+        #[cfg(all(target_os = "linux", feature = "listener-tun"))]
+        let early_binding = meow_api::wait_for_startup_global_route_binding(&raw)
+            .await
+            .context("TUN startup: cannot bind a physical outbound interface; no global routes installed")?;
+        #[cfg(not(all(target_os = "linux", feature = "listener-tun")))]
+        let early_binding = preinstall_global_route_binding(&raw);
         let mut config = if args.config_string.is_some() {
-            early_binding = preinstall_global_route_binding(&raw);
             let config = meow_config::build_config(raw, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?;
             info!("Config loaded from --config-string");
             config
         } else {
-            early_binding = preinstall_global_route_binding(&raw);
             let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
             let config = meow_config::build_config(raw, Some(cache_dir.as_path())).await?;
             info!("Config loaded from {}", config_path);
@@ -806,14 +812,10 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// precedes every one of those sockets; the TUN listener then adopts the
 /// binding instead of installing its own (`TunListener::with_outbound_binding`).
 ///
-/// Shares [`meow_api::preinstall_global_route_binding`] with the config
-/// reload paths, so startup and reload agree on when a binding is due: a
-/// no-op (`None`) unless the raw config selects an enabled TUN in global
-/// route scope — TUN-off and fake-IP-scope startups are untouched.
-/// An install failure is not fatal here: the listener retries before it
-/// touches any route and fails closed with the same error, exactly as
-/// before, and until then no global route exists for a socket to loop on.
-#[cfg(feature = "listener-tun")]
+/// On non-Linux platforms, keep the existing synchronous pre-installation
+/// and listener retry behavior. Linux uses the fallible startup await
+/// before entering the config builder.
+#[cfg(all(not(target_os = "linux"), feature = "listener-tun"))]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
     meow_api::preinstall_global_route_binding(raw, meow_api::PreinstallScope::Startup)
         .into_binding()
