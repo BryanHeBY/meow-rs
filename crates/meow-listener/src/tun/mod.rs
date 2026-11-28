@@ -890,14 +890,18 @@ impl TunListener {
                     // been transferred or dropped, so rollback cannot target
                     // a replacement link.
                     let dns_device = Arc::clone(&device);
-                    let (g, _dns_device) =
-                        tokio::task::spawn_blocking(move || (dns::DnsGuard::setup(addrs, if_index, preexisting_link), dns_device))
-                            .await
-                            .map_err(|join_err| {
-                                Box::new(io::Error::other(format!(
-                                    "dns-guard spawn_blocking panicked: {join_err}"
-                                )))
-                            })?;
+                    let (g, _dns_device) = tokio::task::spawn_blocking(move || {
+                        (
+                            dns::DnsGuard::setup(addrs, if_index, preexisting_link),
+                            dns_device,
+                        )
+                    })
+                    .await
+                    .map_err(|join_err| {
+                        Box::new(io::Error::other(format!(
+                            "dns-guard spawn_blocking panicked: {join_err}"
+                        )))
+                    })?;
                     let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
                     let dns_active = g.is_some();
                     info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");

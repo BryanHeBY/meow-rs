@@ -210,7 +210,9 @@ impl Drop for DnsGuard {
         {
             if let Some(backup) = self.backup.take() {
                 let (backend, result) = match backup {
-                    LinuxRestore::ResolvConf(backup) => ("/etc/resolv.conf", linux::restore(&backup)),
+                    LinuxRestore::ResolvConf(backup) => {
+                        ("/etc/resolv.conf", linux::restore(&backup))
+                    }
                     LinuxRestore::Resolved(link) => ("systemd-resolved link DNS", link.restore()),
                 };
                 if let Err(e) = result {
