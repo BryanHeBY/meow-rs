@@ -3,7 +3,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,14 +13,29 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A managed stub may exist before resolved is ready. Never overwrite it,
 /// even if the daemon is still starting or its D-Bus endpoint fails.
 pub(super) fn manages_system_dns() -> bool {
-    let resolved_run = Path::new(RESOLVED_RUN);
-    let managed_file = std::fs::canonicalize("/etc/resolv.conf")
-        .is_ok_and(|target| target.starts_with(resolved_run))
-        || std::fs::read_link("/etc/resolv.conf")
-            .is_ok_and(|target| target.is_absolute() && target.starts_with(resolved_run));
-    let running = std::fs::metadata(resolved_run.join("io.systemd.Resolve"))
+    let file = Path::new("/etc/resolv.conf");
+    let managed_file = std::fs::canonicalize(file).is_ok_and(|target| managed_target(&target))
+        || std::fs::read_link(file)
+            .is_ok_and(|target| managed_target(&Path::new("/etc").join(target)));
+    let running = std::fs::metadata(Path::new(RESOLVED_RUN).join("io.systemd.Resolve"))
         .is_ok_and(|meta| meta.file_type().is_socket());
     managed_file || running
+}
+
+fn managed_target(link_target: &Path) -> bool {
+    // Read-link can return a relative target, including while /run is
+    // being populated. Recognize managed paths without following them.
+    let mut path = PathBuf::new();
+    for part in link_target.components() {
+        if part == Component::ParentDir {
+            path.pop();
+        } else {
+            path.push(part.as_os_str());
+        }
+    }
+    path.starts_with(RESOLVED_RUN)
+        || path == Path::new("/usr/lib/systemd/resolv.conf")
+        || path == Path::new("/lib/systemd/resolv.conf")
 }
 
 pub(super) struct LinkDns {
@@ -103,6 +118,21 @@ fn call(program: &str, args: &[&str]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_paths_include_the_packaged_static_stub_and_relative_targets() {
+        for managed in [
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/etc/../run/systemd/resolve/resolv.conf",
+            "/etc/../usr/lib/systemd/resolv.conf",
+            "/lib/systemd/resolv.conf",
+        ] {
+            assert!(managed_target(Path::new(managed)), "{managed}");
+        }
+        for unmanaged in ["/etc/resolv.conf", "/run/systemd/resolve-other/resolv.conf"] {
+            assert!(!managed_target(Path::new(unmanaged)), "{unmanaged}");
+        }
+    }
 
     #[test]
     fn registration_only_targets_the_tun_link() {
