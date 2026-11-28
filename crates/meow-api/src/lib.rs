@@ -187,27 +187,49 @@ pub fn preinstall_global_route_binding(
     raw: &RawConfig,
     scope: PreinstallScope,
 ) -> PreinstalledBinding {
-    let iface = requested_global_route_interface(raw, scope);
-    let Some(iface) = iface else {
-        return PreinstalledBinding::default();
-    };
-    let publication = matches!(scope, PreinstallScope::Mutation { .. })
-        .then(meow_common::route_check::publishing);
-    let previous = meow_common::outbound_interface();
-    match meow_listener::OutboundBinding::install(iface.as_deref()) {
-        Ok(binding) => PreinstalledBinding {
-            interface_changed: previous.as_deref() != Some(binding.interface()),
-            binding: Some(binding),
-            _publication: publication,
-        },
-        Err(e) => {
+    match try_preinstall_global_route_binding(raw, scope) {
+        Ok(binding) => binding,
+        Err(error) => {
             tracing::debug!(
-                "early outbound-interface binding failed ({e}); the TUN listener retries \
+                "early outbound-interface binding failed ({error}); the TUN listener retries \
                  before installing routes"
             );
             PreinstalledBinding::default()
         }
     }
+}
+
+#[cfg(feature = "listener-tun")]
+fn try_preinstall_global_route_binding(
+    raw: &RawConfig,
+    scope: PreinstallScope,
+) -> std::io::Result<PreinstalledBinding> {
+    let Some(iface) = requested_global_route_interface(raw, scope) else {
+        return Ok(PreinstalledBinding::default());
+    };
+    let publication = matches!(scope, PreinstallScope::Mutation { .. })
+        .then(meow_common::route_check::publishing);
+    let previous = meow_common::outbound_interface();
+    let binding = meow_listener::OutboundBinding::install(iface.as_deref())?;
+    Ok(PreinstalledBinding {
+        interface_changed: previous.as_deref() != Some(binding.interface()),
+        binding: Some(binding),
+        _publication: publication,
+    })
+}
+
+/// Mutations must not wait for a default route while holding CONFIG_MUTATION.
+/// On Linux a requested-but-failed binding is an admission error, not an
+/// empty successful binding (meaning no binding was requested).
+pub(crate) fn preinstall_mutation_binding(
+    raw: &RawConfig,
+    named_tun_running: bool,
+) -> std::io::Result<PreinstalledBinding> {
+    let scope = PreinstallScope::Mutation { named_tun_running };
+    #[cfg(all(target_os = "linux", feature = "listener-tun"))]
+    return try_preinstall_global_route_binding(raw, scope);
+    #[cfg(not(all(target_os = "linux", feature = "listener-tun")))]
+    Ok(preinstall_global_route_binding(raw, scope))
 }
 
 #[cfg(feature = "listener-tun")]

@@ -34,9 +34,7 @@ use meow_listener::TunListener;
 
 use crate::log_stream::{parse_log_level, LogMessage};
 use crate::ui;
-use crate::{
-    preinstall_global_route_binding, OutboundBinding, PreinstallScope, PreinstalledBinding,
-};
+use crate::{preinstall_mutation_binding, OutboundBinding, PreinstalledBinding};
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
 
@@ -1690,15 +1688,10 @@ async fn update_configs(
         // re-assert the committed values (no-ops) and every tail knob
         // still lands in `finish_patch_writes`, after every fallible
         // step — the same ordering the non-TUN path below already uses.
-        let preinstalled = preinstall_global_route_binding(
-            &candidate,
-            PreinstallScope::Mutation {
-                named_tun_running: matches!(
-                    state.tunnel.tun_owner(),
-                    Some(meow_tunnel::TunOwner::Named(_))
-                ),
-            },
-        );
+        let preinstalled = match prepare_mutation_outbound_binding(&state, &candidate) {
+            Ok(binding) => binding,
+            Err((status, message)) => return msg_err(status, &message),
+        };
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live. The rollback
         // document is the pre-patch one: a failed spawn commits it with
@@ -2396,6 +2389,25 @@ async fn apply_raw_to_tunnel(
     ))
 }
 
+fn prepare_mutation_outbound_binding(
+    state: &AppState,
+    candidate: &RawConfig,
+) -> Result<PreinstalledBinding, (StatusCode, String)> {
+    preinstall_mutation_binding(
+        candidate,
+        matches!(
+            state.tunnel.tun_owner(),
+            Some(meow_tunnel::TunOwner::Named(_))
+        ),
+    )
+    .map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("TUN outbound interface unavailable; current configuration unchanged: {error}"),
+        )
+    })
+}
+
 /// Rebuild routing + DNS from `candidate`, then commit it as the new raw
 /// config and reconcile the TUN listener. Callers must hold the
 /// `CONFIG_MUTATION` lane — it is the sole serialisation of the
@@ -2476,15 +2488,7 @@ async fn commit_raw_candidate(
     if let Some(msg) = routing_mark_change_refused(&candidate) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
-    let preinstalled = preinstall_global_route_binding(
-        &candidate,
-        PreinstallScope::Mutation {
-            named_tun_running: matches!(
-                state.tunnel.tun_owner(),
-                Some(meow_tunnel::TunOwner::Named(_))
-            ),
-        },
-    );
+    let preinstalled = prepare_mutation_outbound_binding(state, &candidate)?;
     let (publish, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
     // tracked TCP: a flush must cancel the flows that predate the binding.
@@ -5511,15 +5515,10 @@ async fn put_configs(
         }
     }
 
-    let preinstalled = preinstall_global_route_binding(
-        &raw_config,
-        PreinstallScope::Mutation {
-            named_tun_running: matches!(
-                state.tunnel.tun_owner(),
-                Some(meow_tunnel::TunOwner::Named(_))
-            ),
-        },
-    );
+    let preinstalled = match prepare_mutation_outbound_binding(&state, &raw_config) {
+        Ok(binding) => binding,
+        Err((status, message)) => return reload_rejected(status, &message),
+    };
     // `smux:`/`mux:` blocks on the static leaves are the last local
     // shape check before candidate network work — a malformed one must
     // reject here, before the ECH pre-resolution opens sockets
@@ -8060,6 +8059,7 @@ mod dns_tun_handoff_tests {
 #[cfg(all(test, feature = "listener-tun", target_os = "linux"))]
 mod global_route_binding_tests {
     use super::*;
+    use crate::{preinstall_global_route_binding, PreinstallScope};
     use meow_common::ProxyAdapter as _;
     use std::io::{Read as _, Write as _};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -8220,18 +8220,29 @@ mod global_route_binding_tests {
         "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
 
     async fn put(state: &Arc<AppState>, yaml: &str) -> (StatusCode, String) {
+        put_to(state, yaml, "/configs").await
+    }
+
+    async fn put_to(state: &Arc<AppState>, yaml: &str, uri: &str) -> (StatusCode, String) {
         use base64::Engine as _;
-        use http_body_util::BodyExt as _;
         let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        send_config(state, "PUT", uri, serde_json::json!({ "payload": payload })).await
+    }
+
+    async fn send_config(
+        state: &Arc<AppState>,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        use http_body_util::BodyExt as _;
         let resp = create_router(Arc::clone(state))
             .oneshot(
                 Request::builder()
-                    .method("PUT")
-                    .uri("/configs")
+                    .method(method)
+                    .uri(uri)
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "payload": payload }).to_string(),
-                    ))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -8384,6 +8395,54 @@ mod global_route_binding_tests {
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
             .await;
+        // Binding failure must reject before rebuild/fetch, including
+        // force and warm edits, without tearing down the live listener.
+        let invalid = GLOBAL_LO.replace(
+            "outbound-interface: lo",
+            "outbound-interface: no-such-iface-zz9",
+        );
+        let (expected_tun, expected_mode) = {
+            let prior = state.raw_config.read();
+            (prior.tun.clone(), prior.mode.clone())
+        };
+        for uri in ["/configs", "/configs?force=true"] {
+            let (status, body) = put_to(&state, &candidate(&invalid, &origin, ""), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.contains("current configuration unchanged"), "{body}");
+        }
+        let (status, body) = send_config(
+            &state,
+            "PATCH",
+            "/configs",
+            serde_json::json!({
+                "tun": { "outbound-interface": "no-such-iface-zz9" },
+                "mode": "direct",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("current configuration unchanged"), "{body}");
+
+        let lane = CONFIG_MUTATION.lock().await;
+        let err = commit_raw_candidate(&state, raw(&candidate(&invalid, &origin, "")), None, lane)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.raw_config.read().tun, expected_tun);
+        assert_eq!(state.raw_config.read().mode, expected_mode);
+        assert_eq!(iface().as_deref(), Some("lo"));
+        assert!(
+            after_drop.lock().is_none(),
+            "previous TUN still owns its handle"
+        );
+        assert!(state.tunnel.has_tun());
+        assert!(
+            origin.take_seen().is_empty(),
+            "no candidate opened a provider socket"
+        );
+        assert!(state.tunnel.inner().nat_table.contains_key(&nat_key));
+        assert!(!listener_flow.is_flushed(), "failed binding does not flush");
+
         let restart =
             format!("{GLOBAL_LO}  mtu: 9000\n  device: meow-name-too-long-for-ifnamsiz\n");
         let (status, body) = put(&state, &candidate(&restart, &origin, "")).await;
