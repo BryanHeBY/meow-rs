@@ -174,10 +174,7 @@ pub(crate) async fn parse_dns_with_fallback_geoip(
     // mihomo `prefer-h3`: applied to every `https://` entry before parsing,
     // so an entry that spells its own `?h3=` keeps the last word.
     let prefer_h3 = dns.prefer_h3.unwrap_or(false);
-    let main_urls = parse_nameserver_entries(&prefer_h3_list(
-        dns.nameserver.as_deref().unwrap_or(&[]),
-        prefer_h3,
-    ))?;
+    let main_urls = main_nameserver_entries(raw, dns, prefer_h3)?;
     let fallback_urls = parse_nameserver_entries(&prefer_h3_list(
         dns.fallback.as_deref().unwrap_or(&[]),
         prefer_h3,
@@ -815,6 +812,39 @@ fn prefer_h3_policy_map(
             (key.clone(), value)
         })
         .collect()
+}
+
+fn main_nameserver_entries(
+    raw: &RawConfig,
+    dns: &crate::raw::RawDns,
+    prefer_h3: bool,
+) -> Result<Vec<NameServerEntry>, anyhow::Error> {
+    if let Some(configured) = &dns.nameserver {
+        return parse_nameserver_entries(&prefer_h3_list(configured, prefer_h3));
+    }
+    // Never replace an explicit DNS routing decision or turn a bootstrap
+    // resolver into a destination for ordinary queries. This default is
+    // limited to generated TUN + fake-IP configs with no DNS sources.
+    if !raw.tun.as_ref().is_some_and(|tun| tun.enable)
+        || dns.enhanced_mode.as_deref() != Some("fake-ip")
+        || dns.default_nameserver.is_some()
+        || dns.fallback.is_some()
+        || dns.nameserver_policy.is_some()
+        || dns.proxy_server_nameserver.is_some()
+        || dns.proxy_server_nameserver_policy.is_some()
+        || dns.direct_nameserver.is_some()
+        || dns.response_rules.is_some()
+    {
+        return Ok(Vec::new());
+    }
+    // Some frontends enable fake-IP DNS when TUN starts without supplying
+    // nameservers. The native resolver may now point back to our TUN. Use
+    // direct encrypted IP-literal upstreams requiring no DNS bootstrap.
+    let defaults = [
+        "https://1.1.1.1/dns-query".to_owned(),
+        "https://8.8.8.8/dns-query".to_owned(),
+    ];
+    parse_nameserver_entries(&prefer_h3_list(&defaults, prefer_h3))
 }
 
 /// Parse nameserver strings into `NameServerEntry`s — every entry must
@@ -1819,6 +1849,58 @@ mod prepared_fallback_geoip_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn implicit_tun_nameservers(tun: bool, mode: &str, fields: &str) -> Vec<NameServerEntry> {
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
+            "tun: {{enable: {tun}}}\ndns:\n  enable: true\n  enhanced-mode: {mode}\n{fields}"
+        ))
+        .unwrap();
+        let dns = raw.dns.as_ref().unwrap();
+        main_nameserver_entries(&raw, dns, dns.prefer_h3.unwrap_or(false)).unwrap()
+    }
+
+    #[test]
+    fn implicit_fake_ip_tun_gets_unproxied_bootstrap_free_defaults() {
+        let entries = implicit_tun_nameservers(true, "fake-ip", "");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.proxy.is_none()
+            && entry.url.needs_bootstrap().is_none()
+            && matches!(entry.url, NameServerUrl::Https { .. })));
+        assert!(
+            implicit_tun_nameservers(true, "fake-ip", "  prefer-h3: true\n")
+                .iter()
+                .all(
+                    |entry| matches!(&entry.url, NameServerUrl::Https { h3, .. } if h3.is_enabled())
+                )
+        );
+        assert!(implicit_tun_nameservers(false, "fake-ip", "").is_empty());
+        assert!(implicit_tun_nameservers(true, "redir-host", "").is_empty());
+    }
+
+    #[test]
+    fn implicit_tun_nameservers_preserve_explicit_dns_routes() {
+        for field in [
+            "nameserver: []",
+            "fallback: []",
+            "fallback: [rcode://refused]",
+            "nameserver-policy: {node.test: 'rcode://refused'}",
+            "default-nameserver: [192.0.2.5]",
+            "default-nameserver: []",
+            "proxy-server-nameserver: [rcode://refused]",
+            "proxy-server-nameserver-policy: {}",
+            "direct-nameserver: [rcode://refused]",
+            "response-rules: []",
+        ] {
+            assert!(
+                implicit_tun_nameservers(true, "fake-ip", &format!("  {field}\n")).is_empty(),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            implicit_tun_nameservers(true, "fake-ip", "  nameserver: [192.0.2.5]\n"),
+            [NameServerEntry::parse("192.0.2.5").unwrap()]
+        );
+    }
 
     /// `dns.prefer-h3` adds the parameter only to `https://` entries, and an
     /// entry that already decided keeps its own answer.
