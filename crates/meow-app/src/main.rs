@@ -666,12 +666,7 @@ fn run_application_inner(
         // No process can reach irreversible TUN setup before its own
         // startup await completes. The service still stops an unpublished
         // Linux child by terminating it; no detached retry survives that.
-        #[cfg(all(target_os = "linux", feature = "listener-tun"))]
-        let early_binding = meow_api::wait_for_startup_global_route_binding(&raw)
-            .await
-            .context("TUN startup: cannot bind a physical outbound interface; no global routes installed")?;
-        #[cfg(not(all(target_os = "linux", feature = "listener-tun")))]
-        let early_binding = preinstall_global_route_binding(&raw);
+        let early_binding = preinstall_global_route_binding(&raw).await?;
         let mut config = if args.config_string.is_some() {
             let config = meow_config::build_config(raw, None)
                 .await
@@ -812,18 +807,32 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// precedes every one of those sockets; the TUN listener then adopts the
 /// binding instead of installing its own (`TunListener::with_outbound_binding`).
 ///
-/// On non-Linux platforms, keep the existing synchronous pre-installation
-/// and listener retry behavior. Linux uses the fallible startup await
-/// before entering the config builder.
-#[cfg(all(not(target_os = "linux"), feature = "listener-tun"))]
-fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    meow_api::preinstall_global_route_binding(raw, meow_api::PreinstallScope::Startup)
-        .into_binding()
-}
-
-#[cfg(not(feature = "listener-tun"))]
-fn preinstall_global_route_binding(_raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    None
+/// Linux waits before the first config-build dial. Other platforms keep
+/// their existing pre-installation and listener retry behavior.
+fn preinstall_global_route_binding(
+    raw: &meow_config::raw::RawConfig,
+) -> impl std::future::Future<Output = Result<EarlyOutboundBinding>> + '_ {
+    #[cfg(all(target_os = "linux", feature = "listener-tun"))]
+    {
+        async {
+            meow_api::wait_for_startup_global_route_binding(raw)
+                .await
+                .context("TUN startup: cannot bind a physical outbound interface; no global routes installed")
+        }
+    }
+    #[cfg(all(not(target_os = "linux"), feature = "listener-tun"))]
+    {
+        std::future::ready(Ok(meow_api::preinstall_global_route_binding(
+            raw,
+            meow_api::PreinstallScope::Startup,
+        )
+        .into_binding()))
+    }
+    #[cfg(not(feature = "listener-tun"))]
+    {
+        let _ = raw;
+        std::future::ready(Ok(None))
+    }
 }
 
 /// The cargo feature a `listeners:` entry needs when this binary did not
@@ -3757,8 +3766,8 @@ mod tests {
 
         /// One test drives every case because the registry is
         /// process-global; separate `#[test]` fns would race each other.
-        #[test]
-        fn preinstalls_only_for_global_route_scope() {
+        #[tokio::test]
+        async fn preinstalls_only_for_global_route_scope() {
             assert!(meow_common::outbound_interface().is_none());
 
             for yaml in [
@@ -3770,17 +3779,24 @@ mod tests {
                 "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: LO\n",
             ] {
                 assert!(
-                    preinstall_global_route_binding(&raw(yaml)).is_none(),
+                    preinstall_global_route_binding(&raw(yaml))
+                        .await
+                        .unwrap()
+                        .is_none(),
                     "{yaml}"
                 );
                 assert!(meow_common::outbound_interface().is_none(), "{yaml}");
             }
 
-            // A failed early install is not fatal (the listener retries and
-            // fails closed) and leaves nothing installed.
+            // Linux rejects startup before building/dialing. macOS keeps
+            // its existing listener retry. Neither installs a binding.
             let missing = "tun:\n  enable: true\n  auto-route: global\n  \
                            outbound-interface: no-such-iface-zz9\n";
-            assert!(preinstall_global_route_binding(&raw(missing)).is_none());
+            let missing = preinstall_global_route_binding(&raw(missing)).await;
+            #[cfg(target_os = "linux")]
+            assert!(missing.is_err());
+            #[cfg(target_os = "macos")]
+            assert!(missing.unwrap().is_none());
             assert!(meow_common::outbound_interface().is_none());
 
             for global in [
@@ -3789,6 +3805,8 @@ mod tests {
                 "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n",
             ] {
                 let binding = preinstall_global_route_binding(&raw(global))
+                    .await
+                    .expect("valid explicit interface")
                     .expect("global route scope pre-installs the binding");
                 assert_eq!(
                     meow_common::outbound_interface().as_deref(),
