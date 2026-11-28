@@ -221,6 +221,13 @@ fn try_preinstall_global_route_binding(
 /// Mutations must not wait for a default route while holding CONFIG_MUTATION.
 /// On Linux a requested-but-failed binding is an admission error, not an
 /// empty successful binding (meaning no binding was requested).
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "listener-tun")),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "API mutation handlers share the fallible Linux TUN admission contract"
+    )
+)]
 pub(crate) fn preinstall_mutation_binding(
     raw: &RawConfig,
     named_tun_running: bool,
