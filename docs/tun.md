@@ -87,12 +87,14 @@ address cannot send packets. Three consequences of how that is done:
   adapter is left as it was found — and the listener moves on to the
   next one.
 
-When the top-level TUN enables fake-IP DNS and the profile omits all DNS
-upstreams and routing policies, Meow uses direct DNS over HTTPS at
-`https://1.1.1.1/dns-query` and `https://8.8.8.8/dns-query`. These IP-literal
-endpoints do not need to resolve a hostname through the TUN before the first
-proxy connection. Configured upstreams and policies are not replaced; set
-`dns.nameserver` to choose another resolver or to `[]` to opt out of the defaults.
+When TUN and fake-IP DNS are enabled without an authored general upstream
+or DNS routing policy, Meow uses DNSPod and AliDNS over direct HTTPS:
+`https://120.53.53.53/dns-query` and `https://223.5.5.5/dns-query`. The
+IP-literal endpoints avoid a hostname bootstrap through the new TUN.
+A dedicated `dns.proxy-server-nameserver` still resolves proxy hostnames
+separately; the defaults are for general queries. Configured upstreams
+and policies are not replaced. Set `dns.nameserver` to choose another
+resolver or to `[]` to opt out of these defaults.
 
 ## Route scopes
 

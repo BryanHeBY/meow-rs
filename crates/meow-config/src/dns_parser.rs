@@ -822,27 +822,30 @@ fn main_nameserver_entries(
     if let Some(configured) = &dns.nameserver {
         return parse_nameserver_entries(&prefer_h3_list(configured, prefer_h3));
     }
-    // Never replace an explicit DNS routing decision or turn a bootstrap
-    // resolver into a destination for ordinary queries. This default is
-    // limited to generated TUN + fake-IP configs with no DNS sources.
+    // Never replace an explicit general DNS route or turn a bootstrap
+    // resolver into an upstream for ordinary queries. A dedicated node
+    // list is independent of the main resolver and can coexist with it.
+    // Keep an explicit node policy outside this default: its hostname
+    // bootstrap can otherwise depend on the newly selected main pool.
     if !raw.tun.as_ref().is_some_and(|tun| tun.enable)
         || dns.enhanced_mode.as_deref() != Some("fake-ip")
         || dns.default_nameserver.is_some()
         || dns.fallback.is_some()
         || dns.nameserver_policy.is_some()
-        || dns.proxy_server_nameserver.is_some()
         || dns.proxy_server_nameserver_policy.is_some()
         || dns.direct_nameserver.is_some()
         || dns.response_rules.is_some()
     {
         return Ok(Vec::new());
     }
-    // Some frontends enable fake-IP DNS when TUN starts without supplying
-    // nameservers. The native resolver may now point back to our TUN. Use
-    // direct encrypted IP-literal upstreams requiring no DNS bootstrap.
+    // A frontend can enable fake-IP DNS without providing a general
+    // nameserver. The native resolver may then point back to this TUN.
+    // Use Mihomo's DNSPod/AliDNS provider families with direct IP-literal
+    // HTTPS endpoints, so neither resolver needs a hostname lookup or a
+    // cleartext bootstrap before the first proxy connection.
     let defaults = [
-        "https://1.1.1.1/dns-query".to_owned(),
-        "https://8.8.8.8/dns-query".to_owned(),
+        "https://120.53.53.53/dns-query".to_owned(),
+        "https://223.5.5.5/dns-query".to_owned(),
     ];
     parse_nameserver_entries(&prefer_h3_list(&defaults, prefer_h3))
 }
@@ -1862,7 +1865,13 @@ mod tests {
     #[test]
     fn implicit_fake_ip_tun_gets_unproxied_bootstrap_free_defaults() {
         let entries = implicit_tun_nameservers(true, "fake-ip", "");
-        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries,
+            [
+                NameServerEntry::parse("https://120.53.53.53/dns-query").unwrap(),
+                NameServerEntry::parse("https://223.5.5.5/dns-query").unwrap(),
+            ]
+        );
         assert!(entries.iter().all(|entry| entry.proxy.is_none()
             && entry.url.needs_bootstrap().is_none()
             && matches!(entry.url, NameServerUrl::Https { .. })));
@@ -1886,7 +1895,6 @@ mod tests {
             "nameserver-policy: {node.test: 'rcode://refused'}",
             "default-nameserver: [192.0.2.5]",
             "default-nameserver: []",
-            "proxy-server-nameserver: [rcode://refused]",
             "proxy-server-nameserver-policy: {}",
             "direct-nameserver: [rcode://refused]",
             "response-rules: []",
@@ -1900,6 +1908,44 @@ mod tests {
             implicit_tun_nameservers(true, "fake-ip", "  nameserver: [192.0.2.5]\n"),
             [NameServerEntry::parse("192.0.2.5").unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn implicit_tun_main_is_independent_of_configured_node_nameservers() {
+        use hickory_proto::{
+            op::ResponseCode,
+            rr::{Name, RecordType},
+        };
+
+        let profile = "tun: {enable: true}\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  use-system-hosts: false\n  proxy-server-nameserver: ['rcode://refused']\n";
+        for (authored_main, count) in [
+            ("", 2),
+            ("  nameserver: []\n", 0),
+            ("  nameserver: ['rcode://success']\n", 1),
+        ] {
+            let cfg = node_policy_config(&format!("{profile}{authored_main}")).await;
+            let main = cfg.resolver.main_nameservers();
+            assert_eq!(cfg.resolver.mode(), DnsMode::FakeIp);
+            assert_eq!(main.len(), count, "{authored_main:?}");
+            if authored_main.is_empty() {
+                for (client, address) in main.iter().zip(["120.53.53.53", "223.5.5.5"]) {
+                    assert!(client
+                        .upstream_label()
+                        .starts_with(&format!("https://{address}")));
+                }
+            }
+            let node = cfg
+                .proxy_resolver
+                .expect("authored node bootstrap stays active");
+            assert_eq!(node.mode(), DnsMode::Normal);
+            assert_eq!(node.main_nameservers().len(), 1);
+            let query = "node.test";
+            let response = node
+                .forward_generic(query, &Name::from_ascii(query).unwrap(), RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        }
     }
 
     /// `dns.prefer-h3` adds the parameter only to `https://` entries, and an
