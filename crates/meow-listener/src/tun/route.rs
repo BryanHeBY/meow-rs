@@ -55,7 +55,7 @@ impl Drop for RouteGuard {
 /// global route scope's outbound-socket binding (#375).
 ///
 /// - Linux reads `/proc/net/route` and returns the interface of the first
-///   UP `0.0.0.0/0` entry.
+///   lowest-metric UP `0.0.0.0/0` entry.
 /// - macOS and Windows list the routing table (`route_manager`) and return
 ///   the interface of the best `0.0.0.0/0` route — see
 ///   [`pick_default_interface`]. On Windows the name is the interface
@@ -174,17 +174,22 @@ fn pick_default_interface(routes: impl IntoIterator<Item = DefaultCandidate>) ->
 /// flag set.
 #[cfg(any(target_os = "linux", test))]
 fn parse_default_interface(table: &str) -> Option<String> {
-    for line in table.lines().skip(1) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        let [iface, dest, _gateway, flags, _refcnt, _use, _metric, mask, ..] = cols[..] else {
-            continue;
-        };
-        let up = u32::from_str_radix(flags, 16).is_ok_and(|f| f & 0x1 != 0);
-        if dest == "00000000" && mask == "00000000" && up {
-            return Some(iface.to_string());
-        }
-    }
-    None
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let iface = cols.next()?;
+            let dest = cols.next()?;
+            let flags = u32::from_str_radix(cols.nth(1)?, 16).ok()?; // skip Gateway
+            let metric = cols.nth(2)?.parse::<u32>().ok()?; // skip RefCnt, Use
+            let mask = cols.next()?;
+            (dest == "00000000" && mask == "00000000" && flags & 0x1 != 0)
+                .then_some((metric, iface))
+        })
+        // Stable for equal metrics, as on the route_manager platforms.
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, iface)| iface.to_owned())
 }
 
 #[cfg(test)]
@@ -200,6 +205,24 @@ mod tests {
             scoped,
             metric,
         }
+    }
+
+    #[test]
+    fn linux_picks_the_lowest_valid_default_metric_independent_of_order() {
+        let wifi = "wlan0 00000000 010200C0 0003 0 0 600 00000000";
+        let wired = "eth0 00000000 0100000A 0003 0 0 100 00000000";
+        let tie = "eth1 00000000 0100000A 0003 0 0 100 00000000";
+        let split = "meow0 00000000 00000000 0001 0 0 0 00000080";
+        let down = "down0 00000000 0100000A 0002 0 0 0 00000000";
+        let invalid = "invalid0 00000000 0100000A 0003 0 0 invalid 00000000";
+        for ordered in [[wifi, wired], [wired, wifi]] {
+            let table = ["HEADER", split, down, invalid, ordered[0], ordered[1]].join("\n");
+            assert_eq!(parse_default_interface(&table).as_deref(), Some("eth0"));
+        }
+        let table = ["HEADER", tie, wired].join("\n");
+        assert_eq!(parse_default_interface(&table).as_deref(), Some("eth1"));
+        let table = ["HEADER", split, down, invalid].join("\n");
+        assert_eq!(parse_default_interface(&table), None);
     }
 
     /// A macOS table with two uplinks: the primary's default is unscoped,
