@@ -80,9 +80,9 @@ impl DnsGuard {
     /// On Windows `addrs` is ignored — the system DNS is always set
     /// to `127.0.0.1` (IPv4) and `::1` (IPv6) so queries reach the
     /// local DNS server (`tun/local_dns.rs`).
-    pub(super) fn setup(addrs: GuardAddrs, if_index: u32) -> Option<Self> {
+    pub(super) fn setup(addrs: GuardAddrs, if_index: u32, preexisting_link: bool) -> Option<Self> {
         #[cfg(not(target_os = "linux"))]
-        let _ = if_index;
+        let _ = (if_index, preexisting_link);
         #[cfg(target_os = "windows")]
         {
             let _ = (addrs.dns, addrs.own);
@@ -125,6 +125,12 @@ impl DnsGuard {
         {
             let dns_addr = addrs.dns;
             if resolved_linux::manages_system_dns() {
+                // A named persistent adapter can belong to another owner.
+                // Revert resets that entire link, so never use it there.
+                if preexisting_link {
+                    warn!("tun dns-guard: leaving resolved DNS unchanged on pre-existing link {if_index}");
+                    return None;
+                }
                 return match resolved_linux::LinkDns::install(if_index, dns_addr) {
                     Ok(link) => {
                         debug!("tun dns-guard: resolved DNS set to {dns_addr} on link {if_index}");

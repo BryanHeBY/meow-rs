@@ -552,6 +552,7 @@ impl TunListener {
         let mut used_addr6 = cfg.inet6_address.map(|net| net.addr());
         let mut last_err: Option<String>;
         let mut if_index: Option<u32> = None;
+        let mut preexisting_link = false;
 
         for attempt in 0..MAX_TUN_RETRIES {
             let name = device_name_for_attempt(cfg.device.as_deref(), attempt);
@@ -586,7 +587,18 @@ impl TunListener {
             // device-create failure into a bogus "offload unavailable"
             // warn-and-retry.
             let offload = cfg!(target_os = "linux") && cfg.stack == TunStack::System;
-            match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
+            match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32, bool)> {
+                #[cfg(target_os = "linux")]
+                let already_present = name_for_closure
+                    .as_deref()
+                    .and_then(|name| std::ffi::CString::new(name).ok())
+                    .is_some_and(|name| {
+                        // SAFETY: the interface name is NUL terminated and
+                        // remains alive for the libc lookup.
+                        (unsafe { libc::if_nametoindex(name.as_ptr()) }) != 0
+                    });
+                #[cfg(not(target_os = "linux"))]
+                let already_present = false;
                 let make = |offload: bool| {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
                 // The system stack takes TSO/GRO aggregates: one NAT
@@ -656,11 +668,11 @@ impl TunListener {
                     Ipv4Net::new_assert(addr, prefix),
                     inet6,
                 )?;
-                Ok((device, if_index))
+                Ok((device, if_index, already_present))
             })
             .await
             {
-                Ok(Ok((d, idx))) => {
+                Ok(Ok((d, idx, already_present))) => {
                     dev_name = d
                         .name()
                         .unwrap_or_else(|_| name.clone().unwrap_or_default());
@@ -668,6 +680,7 @@ impl TunListener {
                     used_addr6 = inet6.map(|net| net.addr());
                     device = Some(d);
                     if_index = Some(idx);
+                    preexisting_link = already_present;
                     break;
                 }
                 Ok(Err(e)) => {
@@ -878,7 +891,7 @@ impl TunListener {
                     // a replacement link.
                     let dns_device = Arc::clone(&device);
                     let (g, _dns_device) =
-                        tokio::task::spawn_blocking(move || (dns::DnsGuard::setup(addrs, if_index), dns_device))
+                        tokio::task::spawn_blocking(move || (dns::DnsGuard::setup(addrs, if_index, preexisting_link), dns_device))
                             .await
                             .map_err(|join_err| {
                                 Box::new(io::Error::other(format!(
